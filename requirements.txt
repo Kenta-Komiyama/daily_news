@@ -1,0 +1,10 @@
+pandas==2.2.2
+requests
+beautifulsoup4
+lxml
+html5lib
+python-dateutil
+trafilatura
+readability-lxml
+openai>=1.40.0
+python-dotenv
