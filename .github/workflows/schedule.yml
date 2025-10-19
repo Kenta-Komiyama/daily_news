@@ -36,7 +36,7 @@ jobs:
       - name: Run crawler
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          LOOKBACK_HOURS: "120"
+          LOOKBACK_HOURS: "24"
           OUT_DIR: "out"
           OPENAI_MODEL: "gpt-5-mini"
         run: |
@@ -58,6 +58,6 @@ jobs:
           GMAIL_TO: ${{ secrets.GMAIL_TO }}
           GMAIL_SUBJECT_PREFIX: "[News]"
           OUT_DIR: "out"
-          LOOKBACK_HOURS: "120"
+          LOOKBACK_HOURS: "24"
         run: |
           python send_email.py
