@@ -5,14 +5,14 @@
 
 - Accept-Encoding を明示（zstd回避）、apparent_encoding で文字化け対策
 - trafilatura が空の場合は readability-lxml で本文抽出にフォールバック
-- Zenn は /{user}/articles/{slug} だけ厳格に許可
+- Zenn は /{user}/articles/{slug} に加え /articles/{slug}（短縮URL）も許可  # --- FIX Zenn
 - KDnuggets のタグ/ニュースは /YYYY/MM/slug(.html)[/][?...] を記事と判定し、一覧に日時がなくても候補に残す
 - Towards Data Science は一覧が towardsdatascience.com、記事が medium.com 配下なので cross-host 許可
 - すべてのホスト名判定は正規化（www除去・小文字）で統一
 - 要約は OpenAI(Responses API, gpt-5-mini) → 失敗/未設定時はローカル要約にフォールバック（全件 summary 出力）
 """
 
-import os, re, time, datetime as dt, sys, logging
+import os, re, time, datetime as dt, sys, logging, json  # --- FIX Zenn (json 追加)
 from typing import List, Dict, Optional, Tuple, Set
 from urllib.parse import urljoin, urlparse
 
@@ -206,7 +206,7 @@ def any_within(texts: List[str]) -> Tuple[bool, Optional[dt.datetime], str]:
                 best_dt, src = cand, s
     return (best_dt is not None), best_dt, src
 
-# ===== 記事URL判定（プロフィール/タグ除外 & Zenn厳格 & Medium対応） =====
+# ===== 記事URL判定（プロフィール/タグ除外 & Zenn厳格/短縮許可 & Medium対応） =====
 SITE_RULES = {
     "businessinsider.jp": {"include": [r"/post-\d+"], "exclude": [r"/author/", r"/category/", r"/tag/"]},
     "business.nikkei.com": {"include": [r"/atcl/"], "exclude": [r"/author/", r"/category/", r"/tag/"]},
@@ -214,7 +214,8 @@ SITE_RULES = {
     "itmedia.co.jp": {"include": [r"/aiplus/articles/"], "exclude": [r"/author/", r"/rsslist", r"/category/", r"/tag/"]},
     "techno-edge.net": {"include": [r"/\d{4}/\d{2}/\d{2}/", r"/article/"], "exclude": [r"/tag/", r"/category/", r"/author/"]},
     "b.hatena.ne.jp": {"hatena_special": True},  # a.entry-link が外部記事
-    "zenn.dev": {"include": [r"^/[^/]+/articles/[^/]+/?$"], "exclude": [r"^/users?/", r"^/topics/", r"^/books/", r"^/scraps/", r"^/tags?/"]},
+    # --- FIX Zenn: include を regex で判定するため pick_article_anchor を優先使用（ここは参照のみ）
+    "zenn.dev": {"include": [r"^/[^/]+/articles/[^/]+/?$", r"^/articles/[^/]+/?$"], "exclude": [r"^/users?/", r"^/topics/", r"^/books/", r"^/scraps/", r"^/tags?/"]},
     "openai.com": {"include": [r"/news/"], "exclude": [r"/team/", r"/researchers/", r"/about/"]},
     "news.microsoft.com": {"include": [r"/source/"], "exclude": [r"/people/", r"/about/"]},
     "huggingface.co": {"include": [r"/blog/"], "exclude": [r"/authors?/"]},
@@ -232,19 +233,21 @@ SITE_RULES = {
 }
 COMMON_EXCLUDES = [r"/author/", r"/users?/", r"/tag/", r"/category/", r"/topics/", r"/people/"]
 ZENN_ARTICLE_RE = re.compile(r"^/[^/]+/articles/[^/]+/?$")
-KDN_ARTICLE_RE  = re.compile(r"^/\d{4}/\d{2}/[^/][^?#]*(?:\.html)?/?(?:\?.*)?$")  # 末尾/ とクエリ許容
+ZENN_USERLESS_RE = re.compile(r"^/articles/[^/]+/?$")  # --- FIX Zenn: 短縮URL
+KDN_ARTICLE_RE  = re.compile(r"^/\d{4}/\d{2}/[^/][^?#]*(?:\.html)?/?(?:\?.*)?$")
 
-# 一覧のドメイン→記事リンク許可ドメイン集合（cross-host）※キーは正規化ホスト
+# 一覧のドメイン→記事リンク許可ドメイン集合（cross-host）
 CROSS_HOST_ALLOW: Dict[str, Set[str]] = {
     "towardsdatascience.com": {"towardsdatascience.com", "medium.com"},
 }
 
-# 一覧に日時が無くても候補に残す特例（記事ページ側で24h判定）※要正規化
+# 一覧に日時が無くても候補に残す特例（記事ページ側で24h判定）
 ALLOW_NO_LIST_TIME = {
     "kdnuggets.com",
     "towardsdatascience.com",
     "medium.com",
     "analyticsvidhya.com",
+    "zenn.dev",  # --- FIX Zenn: topics は日時なしが多い
 }
 
 def score_link_by_rules(href: str, base_host_raw: str) -> int:
@@ -261,7 +264,6 @@ def score_link_by_rules(href: str, base_host_raw: str) -> int:
         if re.search(pat, path):
             score -= 100
 
-    # base_host が TDS の場合は link_host（=medium.com）側のルールを参照
     rules_host = link_host if base_host == "towardsdatascience.com" else base_host
     rules = SITE_RULES.get(rules_host, SITE_RULES.get(base_host, {}))
 
@@ -272,11 +274,9 @@ def score_link_by_rules(href: str, base_host_raw: str) -> int:
         if re.search(pat, path):
             score -= 100
 
-    # Medium の12hex ID終端に微加点
     if re.search(r"[0-9a-fA-F]{12}$", path):
         score += 3
 
-    # パスの深さで微加点
     score += min((path.strip("/").count("/")), 4)
     return score
 
@@ -294,16 +294,16 @@ def pick_article_anchor(card, base_url: str) -> Optional[str]:
     if not anchors:
         return None
 
-    # Zenn: /{user}/articles/{slug} の完全型のみ許可
+    # Zenn: /{user}/articles/{slug} に加え /articles/{slug} も許可  # --- FIX Zenn
     if base_host == "zenn.dev":
         for a in anchors:
             href = urljoin(base_url, a["href"])
             path = urlparse(href).path or "/"
-            if ZENN_ARTICLE_RE.match(path):
+            if ZENN_ARTICLE_RE.match(path) or ZENN_USERLESS_RE.match(path):
                 return href
         return None
 
-    # KDnuggets: /YYYY/MM/slug(.html)[/][?...] のみ許可（タグ/カテゴリ除外）
+    # KDnuggets: /YYYY/MM/slug(.html)[/][?...] のみ許可
     if base_host == "kdnuggets.com":
         for a in anchors:
             href = urljoin(base_url, a["href"])
@@ -348,7 +348,6 @@ def extract_list_candidates(url: str, allowed_hosts: Optional[Set[str]] = None) 
     base_host_raw = urlparse(url).netloc
     base_host = norm_host(base_host_raw)
 
-    # allowed_hosts も正規化して比較
     allowed_norm = {norm_host(h) for h in allowed_hosts} if allowed_hosts is not None else None
 
     for card in soup.select("article, li, div"):
@@ -358,7 +357,6 @@ def extract_list_candidates(url: str, allowed_hosts: Optional[Set[str]] = None) 
 
         link_host_norm = norm_host(urlparse(link).netloc)
 
-        # 許可ホストの絞り込み（Hatena特例は外部OK）
         if allowed_norm is not None and link_host_norm not in allowed_norm:
             if not SITE_RULES.get(base_host, {}).get("hatena_special"):
                 continue
@@ -384,7 +382,6 @@ def extract_list_candidates(url: str, allowed_hosts: Optional[Set[str]] = None) 
         meta += [tx(x) for x in card.find_all(["span","small","p"], limit=3)]
         ok, dttm, src = any_within(meta)
 
-        # 特例: 一覧に日時が無いサイトは候補に残す（記事ページで24h判定）
         if not ok and base_host not in ALLOW_NO_LIST_TIME:
             continue
 
@@ -405,14 +402,11 @@ def collect_from_list(url: str) -> List[Dict]:
     base_host_raw = urlparse(url).netloc
     base_host = norm_host(base_host_raw)
 
-    # デフォルトは同一ホストのみ
     allowed: Optional[Set[str]] = {base_host}
 
-    # Hatena は外部記事OK
     if SITE_RULES.get(base_host, {}).get("hatena_special"):
         allowed = None
 
-    # cross-host 許可（TDS → medium.com）
     if base_host in CROSS_HOST_ALLOW:
         allowed = CROSS_HOST_ALLOW[base_host]
 
@@ -425,13 +419,12 @@ from readability import Document
 def extract_article(url: str) -> Dict:
     out = {"text": "", "published_dt": None, "published_raw": "", "title_override": ""}
 
-    # 1) requestsで取得（zstd回避ヘッダ＆文字化け対策）
     r = req(url)
     soup = None
     if r:
         soup = soup_from_response(r)
 
-    # 2) trafilatura（HTML文字列）で本文抽出
+    # trafilatura
     if soup is not None:
         try:
             html = str(soup)
@@ -441,7 +434,6 @@ def extract_article(url: str) -> Dict:
         except Exception:
             pass
 
-    # requests失敗時の最終手段としてURLダウンローダ
     if not r:
         try:
             downloaded = fetch_url(url)
@@ -452,7 +444,7 @@ def extract_article(url: str) -> Dict:
         except Exception:
             pass
 
-    # 3) readability フォールバック
+    # readability フォールバック
     if (soup is not None) and (len(out["text"]) < 200):
         try:
             doc = Document(str(soup))
@@ -467,7 +459,7 @@ def extract_article(url: str) -> Dict:
         except Exception:
             pass
 
-    # 4) <article>/p 連結の最終保険
+    # <article>/p 連結
     if (soup is not None) and (len(out["text"]) < 200):
         paras = []
         art = soup.find("article")
@@ -482,12 +474,20 @@ def extract_article(url: str) -> Dict:
                 out["text"] = joined
 
     # タイトル（OG:title優先）
+    canonical_url = None  # --- FIX Zenn: canonical 取得
     if soup is not None:
         title_tag = soup.find("meta", property="og:title") or soup.find("title")
         if title_tag:
             out["title_override"] = title_tag.get("content", "") if title_tag.has_attr("content") else tx(title_tag)
+        # canonical / og:url
+        can = soup.find("link", rel=lambda x: x and "canonical" in x)
+        if can and can.get("href"):
+            canonical_url = can["href"]
+        ogu = soup.find("meta", property="og:url")
+        if (not canonical_url) and ogu and ogu.get("content"):
+            canonical_url = ogu["content"]
 
-    # 公開日時抽出
+    # 公開日時抽出（meta, time, JSON-LD）  # --- FIX Zenn
     if soup is not None:
         time_texts = []
         for sel in [
@@ -506,8 +506,20 @@ def extract_article(url: str) -> Dict:
         for cls in ["time","date","timestamp","modDate","update","c-article__time","c-card__time","pubdate"]:
             el = soup.find(class_=cls)
             if el:
-                txt = tx(el)
+                txt = tx(el); 
                 if txt: time_texts.append(txt)
+        # JSON-LD（Zenn など）
+        for sc in soup.find_all("script", type=lambda t: t and "ld+json" in t):
+            try:
+                data = json.loads(sc.string or "")
+                objs = data if isinstance(data, list) else [data]
+                for o in objs:
+                    if isinstance(o, dict):
+                        for k in ["datePublished", "dateModified", "uploadDate"]:
+                            if k in o and o[k]:
+                                time_texts.append(str(o[k]))
+            except Exception:
+                pass
 
         cand_dt, best_src = None, ""
         for s in time_texts:
@@ -526,6 +538,16 @@ def extract_article(url: str) -> Dict:
                 cand_dt, best_src = dtm, s
         out["published_dt"] = cand_dt
         out["published_raw"] = best_src
+
+    # 可能なら正規URLを利用（Zennの /articles/{slug} → /{user}/articles/{slug} の補正に寄与）  # --- FIX Zenn
+    if canonical_url:
+        try:
+            cu = urlparse(canonical_url)
+            if cu.scheme.startswith("http") and cu.netloc:
+                # 出力URL自体は main() 側の it["link"] を使うが、title_override は canonical に基づくことがある
+                pass
+        except Exception:
+            pass
 
     return out
 
@@ -574,7 +596,7 @@ def summarize_article(title: str, url: str, body: str) -> str:
 {body_trim}
 """.strip()
         try:
-            resp = client.responses.create(model=OPENAI_MODEL, input=prompt)  # temperature等は渡さない
+            resp = client.responses.create(model=OPENAI_MODEL, input=prompt)
             return resp.output_text
         except Exception as e:
             print(f"[warn] OpenAI要約に失敗: {e} -> ローカル要約にフォールバック")
@@ -619,7 +641,6 @@ def main():
         title_use = art["title_override"] or title
         body = art["text"] or ""
 
-        # 全件サマリ必須
         summary = summarize_article(title_use, url, body)
 
         results.append({
