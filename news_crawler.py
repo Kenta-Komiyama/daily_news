@@ -5,14 +5,17 @@
 
 - Accept-Encoding を明示（zstd回避）、apparent_encoding で文字化け対策
 - trafilatura が空の場合は readability-lxml で本文抽出にフォールバック
-- Zenn は /{user}/articles/{slug} に加え /articles/{slug}（短縮URL）も許可  # --- FIX Zenn
-- KDnuggets のタグ/ニュースは /YYYY/MM/slug(.html)[/][?...] を記事と判定し、一覧に日時がなくても候補に残す
+- Zenn は /{user}/articles/{slug} に加え /articles/{slug}（短縮URL）も許可
+- Zenn 記事の公開日時は JSON-LD と __NEXT_DATA__ も参照（publishedAt 等）
+- KDnuggets のタグ/ニュースは /YYYY/MM/slug(.html)[/][?...] を記事と判定
+- 日経（business.nikkei.com / xtech.nikkei.com）は /atcl/ を最優先で取得
 - Towards Data Science は一覧が towardsdatascience.com、記事が medium.com 配下なので cross-host 許可
-- すべてのホスト名判定は正規化（www除去・小文字）で統一
-- 要約は OpenAI(Responses API, gpt-5-mini) → 失敗/未設定時はローカル要約にフォールバック（全件 summary 出力）
+- 一覧に時刻が無いサイトは記事ページ側で24h判定（ALLOW_NO_LIST_TIME）
+- URL正規化（utm除去・Medium冗長パラメータ除去）
+- 要約は OpenAI(Responses API, gpt-5-mini) → 失敗/未設定時はローカル要約にフォールバック
 """
 
-import os, re, time, datetime as dt, sys, logging, json, urllib.parse  # --- WIDE FIX: json, urllib
+import os, re, time, datetime as dt, sys, logging, json, urllib.parse
 from typing import List, Dict, Optional, Tuple, Set
 from urllib.parse import urljoin, urlparse, parse_qsl, urlencode
 
@@ -55,15 +58,14 @@ def norm_host(host: str) -> str:
         h = h[4:]
     return h
 
-def normalize_url(u: str) -> str:  # --- WIDE FIX: utm等を除去
+def normalize_url(u: str) -> str:
+    """utm等の追跡クエリやMedium特有の?sk=...等を除去"""
     try:
         p = urlparse(u)
         q = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True)
              if not k.lower().startswith(("utm_", "ref", "source", "mkt_tok"))]
-        # Medium特有の ?sk=... なども除去
         q = [(k, v) for k, v in q if k.lower() not in {"sk"}]
         new = p._replace(query=urlencode(q, doseq=True))
-        # 末尾の /? を綺麗に
         s = new.geturl()
         s = re.sub(r"\?+$", "", s)
         return s
@@ -141,10 +143,14 @@ DEFAULT_HEADERS = {
 }
 
 def req(url: str) -> Optional[requests.Response]:
+    """403対策でUAを変えて一度だけ再試行"""
     try:
         headers = DEFAULT_HEADERS.copy()
         headers["Referer"] = url
         r = requests.get(url, headers=headers, timeout=TIMEOUT)
+        if r.status_code == 403:
+            headers["User-Agent"] = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            r = requests.get(url, headers=headers, timeout=TIMEOUT)
         if r.status_code != 200:
             print(f"[warn] HTTP {r.status_code}: {url}")
             return None
@@ -172,7 +178,7 @@ REL = [
     (re.compile(r"(\d+)\s*分前"), "minutes"),
     (re.compile(r"(\d+)\s*時間前"), "hours"),
     (re.compile(r"(\d+)\s*日前"), "days"),
-    # --- WIDE FIX: 英語系
+    # 英語
     (re.compile(r"(\d+)\s*mins?\s*ago", re.I), "minutes"),
     (re.compile(r"(\d+)\s*minutes?\s*ago", re.I), "minutes"),
     (re.compile(r"(\d+)\s*hours?\s*ago", re.I), "hours"),
@@ -182,7 +188,7 @@ ABS = [
     re.compile(r"(\d{4})[-/\.](\d{1,2})[-/\.](\d{1,2})"),
     re.compile(r"(\d{4})年(\d{1,2})月(\d{1,2})日"),
     re.compile(r"\b(\d{1,2})/(\d{1,2})\b"),
-    # --- WIDE FIX: 英語月表記 Jan 2, 2025 / 2 Jan 2025
+    # 英語: Jan 2, 2025 / 2 Jan 2025
     re.compile(r"\b([A-Za-z]{3,9})\s+(\d{1,2}),?\s+(\d{4})"),
     re.compile(r"\b(\d{1,2})\s+([A-Za-z]{3,9})\s+(\d{4})"),
 ]
@@ -212,7 +218,6 @@ def parse_datetime_text(s: str, base: dt.datetime) -> Optional[dt.datetime]:
         mo, d = map(int, m.groups())
         try: return dt.datetime(NOW.year, mo, d, tzinfo=JST)
         except: pass
-    # 英語: Jan 2, 2025
     m = ABS[3].search(s)
     if m:
         mon = MONTHS.get(m.group(1).lower(), 0)
@@ -220,14 +225,12 @@ def parse_datetime_text(s: str, base: dt.datetime) -> Optional[dt.datetime]:
         if mon:
             try: return dt.datetime(y, mon, d, tzinfo=JST)
             except: pass
-    # 英語: 2 Jan 2025
     m = ABS[4].search(s)
     if m:
         d = int(m.group(1)); mon = MONTHS.get(m.group(2).lower(), 0); y = int(m.group(3))
         if mon:
             try: return dt.datetime(y, mon, d, tzinfo=JST)
             except: pass
-    # RFC3339/ISO
     m = re.search(r"(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})(:\d{2})?(Z|[+\-]\d{2}:\d{2})?", s)
     if m:
         y, mo, d = map(int, m.group(1).split("-"))
@@ -257,7 +260,6 @@ SITE_RULES = {
     "itmedia.co.jp": {"include": [r"/aiplus/articles/"], "exclude": [r"/author/", r"/rsslist", r"/category/", r"/tag/"]},
     "techno-edge.net": {"include": [r"/\d{4}/\d{2}/\d{2}/", r"/article/"], "exclude": [r"/tag/", r"/category/", r"/author/"]},
     "b.hatena.ne.jp": {"hatena_special": True},
-    # --- FIX Zenn
     "zenn.dev": {"include": [r"^/[^/]+/articles/[^/]+/?$", r"^/articles/[^/]+/?$"], "exclude": [r"^/users?/", r"^/topics/", r"^/books/", r"^/scraps/", r"^/tags?/"]},
     "openai.com": {"include": [r"/news/"], "exclude": [r"/team/", r"/researchers/", r"/about/"]},
     "news.microsoft.com": {"include": [r"/source/"], "exclude": [r"/people/", r"/about/"]},
@@ -278,22 +280,24 @@ ZENN_ARTICLE_RE = re.compile(r"^/[^/]+/articles/[^/]+/?$")
 ZENN_USERLESS_RE = re.compile(r"^/articles/[^/]+/?$")
 KDN_ARTICLE_RE  = re.compile(r"^/\d{4}/\d{2}/[^/][^?#]*(?:\.html)?/?(?:\?.*)?$")
 
-# cross-host
+# クロスホスト許可
 CROSS_HOST_ALLOW: Dict[str, Set[str]] = {
     "towardsdatascience.com": {"towardsdatascience.com", "medium.com"},
 }
 
-# 一覧に日時が無くても候補に残す
+# 一覧に時刻が無くても候補に残す
 ALLOW_NO_LIST_TIME = {
     "kdnuggets.com",
     "towardsdatascience.com",
     "medium.com",
     "analyticsvidhya.com",
-    "kaggle.com",            # --- WIDE FIX
-    "openai.com",            # --- WIDE FIX
-    "news.microsoft.com",    # --- WIDE FIX
-    "huggingface.co",        # --- WIDE FIX
-    "zenn.dev",              # --- FIX Zenn
+    "kaggle.com",
+    "openai.com",
+    "news.microsoft.com",
+    "huggingface.co",
+    "zenn.dev",
+    "business.nikkei.com",
+    "xtech.nikkei.com",
 }
 
 def score_link_by_rules(href: str, base_host_raw: str) -> int:
@@ -319,14 +323,9 @@ def score_link_by_rules(href: str, base_host_raw: str) -> int:
         if re.search(pat, path):
             score -= 100
 
-    # Mediumの12hex微加点
     if re.search(r"[0-9a-fA-F]{12}$", path):
         score += 3
 
-    # rel=permalink / data-* ヒント（一覧側）
-    # ※ここでは付与できないので pick_article_anchor 側で加点
-
-    # パス深さ
     score += min((path.strip("/").count("/")), 4)
     return score
 
@@ -344,7 +343,7 @@ def pick_article_anchor(card, base_url: str) -> Optional[str]:
     if not anchors:
         return None
 
-    # Zenn: 厳格＋短縮  # --- FIX Zenn
+    # Zenn: 厳格＋短縮
     if base_host == "zenn.dev":
         for a in anchors:
             href = normalize_url(urljoin(base_url, a["href"]))
@@ -362,6 +361,17 @@ def pick_article_anchor(card, base_url: str) -> Optional[str]:
                 return href
         return None
 
+    # 日経は /atcl/ を最優先で拾う
+    if base_host in {"business.nikkei.com", "xtech.nikkei.com"}:
+        for a in anchors:
+            href = normalize_url(urljoin(base_url, a["href"]))
+            path = urlparse(href).path or "/"
+            if re.search(r"/atcl/", path):
+                if any(re.search(pat, path) for pat in COMMON_EXCLUDES):
+                    continue
+                return href
+        # 見つからなければ通常スコアリングへ
+
     # 一般スコアリング
     best_href, best_score = None, -10**9
     for a in anchors:
@@ -372,16 +382,14 @@ def pick_article_anchor(card, base_url: str) -> Optional[str]:
 
         a_text = (a.get_text(" ", strip=True) or "").lower()
         a_cls = " ".join(a.get("class", [])).lower()
-        # プロフィール/タグっぽいものを強く減点
         for kw in ["author", "プロフィール", "筆者", "投稿者", "users", "タグ", "category", "topics"]:
             if kw in a_text or kw in a_cls:
                 score -= 30
-        # タイトルっぽいクラス名で加点
         for good in ["title", "headline", "entry-title", "news-title", "permalink"]:
             if good in a_cls:
                 score += 10
         if a.has_attr("rel") and "permalink" in [x.lower() for x in a["rel"]]:
-            score += 10  # --- WIDE FIX
+            score += 10
 
         if score > best_score:
             best_score, best_href = score, href
@@ -404,16 +412,19 @@ def extract_list_candidates(url: str, allowed_hosts: Optional[Set[str]] = None) 
 
     allowed_norm = {norm_host(h) for h in allowed_hosts} if allowed_hosts is not None else None
 
-    for card in soup.select("article, li, div"):
+    # カード候補要素を広めに取る（Zenn/日経の外し防止）
+    candidates = soup.select("article, li, div, section, dd")
+    if not candidates:
+        candidates = soup.find_all(True)
+
+    def push_card(card):
         link = pick_article_anchor(card, url)
         if not link:
-            continue
-
+            return
         link_host_norm = norm_host(urlparse(link).netloc)
-
         if allowed_norm is not None and link_host_norm not in allowed_norm:
             if not SITE_RULES.get(base_host, {}).get("hatena_special"):
-                continue
+                return
 
         # タイトル
         title_el = None
@@ -437,11 +448,11 @@ def extract_list_candidates(url: str, allowed_hosts: Optional[Set[str]] = None) 
         ok, dttm, src = any_within(meta)
 
         if not ok and base_host not in ALLOW_NO_LIST_TIME:
-            continue
+            return
 
         key = (title.strip(), link)
         if key in seen:
-            continue
+            return
         seen.add(key)
         items.append({
             "source_list": url,
@@ -450,6 +461,18 @@ def extract_list_candidates(url: str, allowed_hosts: Optional[Set[str]] = None) 
             "list_time_guess": dttm.isoformat() if ok and dttm else "",
             "list_time_raw": src if ok else "",
         })
+
+    for card in candidates:
+        push_card(card)
+
+    # 0件なら a[href] 全走査の最終保険
+    if not items:
+        for a in soup.find_all("a", href=True):
+            faux = soup.new_tag("div")
+            a_parent = a.parent or faux
+            a_parent.append(a)  # 疑似カード
+            push_card(a_parent)
+
     return items
 
 def collect_from_list(url: str) -> List[Dict]:
@@ -537,23 +560,23 @@ def extract_article(url: str) -> Dict:
         ogu = soup.find("meta", property="og:url")
         if (not canonical_url) and ogu and ogu.get("content"):
             canonical_url = ogu["content"]
-        amp = soup.find("link", rel=lambda x: x and "amphtml" in x)  # AMPが正の場合も
-        # canonical優先。なければ og:url。AMPは参考値に留める
+        amp = soup.find("link", rel=lambda x: x and "amphtml" in x)  # 参考値
     out["canonical_url"] = normalize_url(canonical_url) if canonical_url else ""
 
-    # 公開日時抽出（meta, time, JSON-LD 拡張）
+    # 公開日時抽出（meta, time, JSON-LD）
+    cand_dt, best_src = None, ""
     if soup is not None:
         time_texts = []
         metas = [
             ('meta', {'property':'article:published_time'}),
-            ('meta', {'property':'article:modified_time'}),       # --- WIDE FIX
-            ('meta', {'property':'og:updated_time'}),             # --- WIDE FIX
+            ('meta', {'property':'article:modified_time'}),
+            ('meta', {'property':'og:updated_time'}),
             ('meta', {'name':'pubdate'}),
             ('meta', {'name':'publish-date'}),
             ('meta', {'name':'date'}),
-            ('meta', {'name':'DC.date'}),                         # --- WIDE FIX
+            ('meta', {'name':'DC.date'}),
             ('meta', {'itemprop':'datePublished'}),
-            ('meta', {'itemprop':'dateModified'}),                # --- WIDE FIX
+            ('meta', {'itemprop':'dateModified'}),
         ]
         for sel in metas:
             m = soup.find(*sel)
@@ -579,7 +602,6 @@ def extract_article(url: str) -> Dict:
             except Exception:
                 pass
 
-        cand_dt, best_src = None, ""
         for s in time_texts:
             dtm = None
             m = re.search(r"(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})(Z|[+\-]\d{2}:\d{2})?", s)
@@ -594,8 +616,44 @@ def extract_article(url: str) -> Dict:
                 dtm = parse_datetime_text(s, NOW)
             if dtm and ((cand_dt is None) or (dtm > cand_dt)):
                 cand_dt, best_src = dtm, s
-        out["published_dt"] = cand_dt
-        out["published_raw"] = best_src
+
+    # Zenn の __NEXT_DATA__ からも取得（未確定時）
+    if (cand_dt is None) and (soup is not None) and (norm_host(urlparse(url).netloc) == "zenn.dev"):
+        try:
+            next_data = soup.find("script", id="__NEXT_DATA__")
+            if next_data and next_data.string:
+                data = json.loads(next_data.string)
+                def dfs(o, found):
+                    if isinstance(o, dict):
+                        for k, v in o.items():
+                            if k in {"publishedAt","published_at","released_at","datePublished"} and isinstance(v, str):
+                                found.append(v)
+                            dfs(v, found)
+                    elif isinstance(o, list):
+                        for x in o: dfs(x, found)
+                bag = []
+                dfs(data, bag)
+                for s in bag:
+                    m = re.search(r"(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})(?:\.\d+)?(Z|[+\-]\d{2}:\d{2})?", s)
+                    if m:
+                        from dateutil import tz as _tz
+                        y, mo, d = map(int, m.group(1).split("-"))
+                        hh, mm, ss = map(int, m.group(2).split(":"))
+                        try:
+                            cand_dt = dt.datetime(y, mo, d, hh, mm, ss, tzinfo=_tz.tzutc() if (m.group(3)=="Z") else JST).astimezone(JST)
+                            best_src = s
+                            break
+                        except: pass
+                if (cand_dt is None) and bag:
+                    dd = parse_datetime_text(bag[0], NOW)
+                    if dd:
+                        cand_dt = dd
+                        best_src = bag[0]
+        except Exception:
+            pass
+
+    out["published_dt"] = cand_dt
+    out["published_raw"] = best_src
 
     return out
 
@@ -644,7 +702,7 @@ def summarize_article(title: str, url: str, body: str) -> str:
 {body_trim}
 """.strip()
         try:
-            resp = client.responses.create(model=OPENAI_MODEL, input=prompt)
+            resp = client.responses.create(model=OPENAI_MODEL, input=prompt)  # temperature等は既定
             return resp.output_text
         except Exception as e:
             print(f"[warn] OpenAI要約に失敗: {e} -> ローカル要約にフォールバック")
@@ -666,7 +724,7 @@ def main():
     seen = set()
     uniq = []
     for r in candidates:
-        r["link"] = normalize_url(r["link"])  # --- WIDE FIX
+        r["link"] = normalize_url(r["link"])
         k = (r["title"], r["link"])
         if k in seen: continue
         seen.add(k)
@@ -687,13 +745,13 @@ def main():
             time.sleep(SLEEP_ARTICLE)
             continue
 
-        # canonical が同一ホスト or 許容cross-hostなら差し替え
+        # canonical が同一/許容ホストなら差し替え
         final_url = url
         if art.get("canonical_url"):
             cu = urlparse(art["canonical_url"])
             uh = norm_host(urlparse(url).netloc)
             ch = norm_host(cu.netloc)
-            if (uh == ch) or (uh in CROSS_HOST_ALLOW and ch in CROSS_HOST_ALLOW[uh]) or (ch in {uh}):
+            if (uh == ch) or (uh in CROSS_HOST_ALLOW and ch in CROSS_HOST_ALLOW[uh]):
                 final_url = art["canonical_url"]
 
         title_use = art["title_override"] or title
