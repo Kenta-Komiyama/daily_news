@@ -58,6 +58,6 @@ jobs:
           GMAIL_TO: ${{ secrets.GMAIL_TO }}
           GMAIL_SUBJECT_PREFIX: "[News]"
           OUT_DIR: "out"
-          LOOKBACK_HOURS: "24"
+          LOOKBACK_HOURS: "120"
         run: |
           python send_email.py
