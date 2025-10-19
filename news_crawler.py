@@ -35,7 +35,7 @@ for name in ["trafilatura", "trafilatura.core", "trafilatura.utils"]:
 # ===== 基本設定 =====
 JST = tz.gettz("Asia/Tokyo")
 NOW = dt.datetime.now(JST)
-LOOKBACK_HOURS = int(os.environ.get("LOOKBACK_HOURS", "120"))  # 24h
+LOOKBACK_HOURS = int(os.environ.get("LOOKBACK_HOURS", "24"))  # 24h
 THRESHOLD = NOW - dt.timedelta(hours=LOOKBACK_HOURS)
 TIMEOUT = 25
 
