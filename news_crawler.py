@@ -115,6 +115,14 @@ TARGET_LIST_PAGES = [
     "https://codezine.jp/data/",
     "https://codezine.jp/case/",
     "https://www.publickey1.jp/",
+    # ==== ここから追加: Qiita ====
+    "https://qiita.com/tags/%E6%A9%9F%E6%A2%B0%E5%AD%A6%E7%BF%92",
+    "https://qiita.com/tags/AI",
+    "https://qiita.com/tags/DeepLearning",
+    "https://qiita.com/tags/LLM",
+    "https://qiita.com/tags/%E8%87%AA%E7%84%B6%E8%A8%80%E8%AA%9E%E5%87%A6%E7%90%86",
+    "https://qiita.com/tags/Python",
+    # ==== ここまで追加 ====
 ]
 
 # ===== OpenAI（要約） =====
@@ -274,6 +282,19 @@ SITE_RULES = {
     "analyticsvidhya.com": {"include": [r"^/blog/\d{4}/\d{2}/[^/].*"], "exclude": [r"/category/", r"/tag/"]},
     "codezine.jp": {"include": [r"^/article/detail/\d+\.html$"], "exclude": [r"^/category/", r"^/tag/"]},
     "publickey1.jp": {"include": [r"^/blog/\d{4}/\d{2}/[^/].*\.html$"], "exclude": []},
+    # ==== ここから追加: Qiita ====
+    "qiita.com": {
+        "include": [r"^/[^/]+/items/[0-9a-fA-F]{20}$"],
+        "exclude": [
+            r"^/tags?/",
+            r"^/organizations?/",
+            r"^/advent-calendar/",
+            r"/edit$",
+            r"/likes$",
+            r"/comments?$",
+        ],
+    },
+    # ==== ここまで追加 ====
 }
 COMMON_EXCLUDES = [r"/author/", r"/users?/", r"/tag/", r"/category/", r"/topics/", r"/people/"]
 ZENN_ARTICLE_RE = re.compile(r"^/[^/]+/articles/[^/]+/?$")
@@ -298,6 +319,9 @@ ALLOW_NO_LIST_TIME = {
     "zenn.dev",
     "business.nikkei.com",
     "xtech.nikkei.com",
+    # ==== ここから追加 ====
+    "qiita.com",
+    # ==== ここまで追加 ====
 }
 
 def score_link_by_rules(href: str, base_host_raw: str) -> int:
@@ -342,6 +366,16 @@ def pick_article_anchor(card, base_url: str) -> Optional[str]:
     anchors = card.find_all("a", href=True)
     if not anchors:
         return None
+
+    # ==== Qiita 専用: /ユーザー名/items/20桁hex のみ記事とみなす ====
+    if base_host == "qiita.com":
+        for a in anchors:
+            href = normalize_url(urljoin(base_url, a["href"]))
+            path = urlparse(href).path or "/"
+            if re.match(r"^/[^/]+/items/[0-9a-fA-F]{20}$", path):
+                return href
+        return None
+    # ==== ここまで Qiita ====
 
     # Zenn: 厳格＋短縮
     if base_host == "zenn.dev":
