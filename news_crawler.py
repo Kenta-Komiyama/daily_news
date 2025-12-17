@@ -74,6 +74,7 @@ def normalize_url(u: str) -> str:
 
 # ===== 対象「一覧」ページ =====
 TARGET_LIST_PAGES = [
+    # 日経・国内メディア
     "https://business.nikkei.com/latest/?i_cid=nbpnb_latest",
     "https://www.businessinsider.jp/category/business/",
     "https://www.businessinsider.jp/category/tech-news/",
@@ -84,17 +85,27 @@ TARGET_LIST_PAGES = [
     "https://www.techno-edge.net/special/557/recent/%E7%94%9F%E6%88%90AI%E3%82%A6%E3%82%A3%E3%83%BC%E3%82%AF%E3%83%AA%E3%83%BC",
     "https://b.hatena.ne.jp/hotentry/it",
     "https://b.hatena.ne.jp/entrylist/it/AI%E3%83%BB%E6%A9%9F%E6%A2%B0%E5%AD%A6%E7%BF%92",
+    # Zenn
     "https://zenn.dev/topics/%E6%A9%9F%E6%A2%B0%E5%AD%A6%E7%BF%92",
     "https://zenn.dev/topics/ai",
     "https://zenn.dev/topics/deeplearning",
     "https://zenn.dev/topics/nlp",
     "https://zenn.dev/topics/python",
+    # OpenAI
     "https://openai.com/ja-JP/news/",
+    "https://openai.com/news/",
+    "https://openai.com/blog/",
+    # Microsoft
     "https://news.microsoft.com/source/topics/ai/",
+    "https://blogs.microsoft.com/ai/",
+    "https://azure.microsoft.com/en-us/blog/topics/ai-machine-learning/",
+    # Hugging Face
     "https://huggingface.co/blog",
+    # AI-SCHOLAR / SIGNATE / Kaggle
     "https://ai-scholar.tech/",
     "https://competition-content.signate.jp/articles",
     "https://www.kaggle.com/blog?sort=hotness",
+    # KDnuggets
     "https://www.kdnuggets.com/news/index.html",
     "https://www.kdnuggets.com/tag/artificial-intelligence",
     "https://www.kdnuggets.com/tag/computer-vision",
@@ -108,21 +119,30 @@ TARGET_LIST_PAGES = [
     "https://www.kdnuggets.com/tag/mlops",
     "https://www.kdnuggets.com/tag/programming",
     "https://www.kdnuggets.com/tag/sql",
+    # Towards Data Science
     "https://towardsdatascience.com/latest/",
     "https://towardsdatascience.com/tag/editors-pick/",
     "https://towardsdatascience.com/tag/deep-dives/",
+    # Analytics Vidhya / CodeZine / Publickey
     "https://www.analyticsvidhya.com/blog-archive/",
     "https://codezine.jp/data/",
     "https://codezine.jp/case/",
     "https://www.publickey1.jp/",
-    # ==== ここから追加: Qiita ====
+    # Qiita（AI/ML系タグ）
     "https://qiita.com/tags/%E6%A9%9F%E6%A2%B0%E5%AD%A6%E7%BF%92",
     "https://qiita.com/tags/AI",
     "https://qiita.com/tags/DeepLearning",
     "https://qiita.com/tags/LLM",
     "https://qiita.com/tags/%E8%87%AA%E7%84%B6%E8%A8%80%E8%AA%9E%E5%87%A6%E7%90%86",
     "https://qiita.com/tags/Python",
-    # ==== ここまで追加 ====
+    # Google
+    "https://blog.google/technology/ai/",
+    "https://ai.googleblog.com/",
+    "https://deepmind.google/discover/blog",
+    "https://cloud.google.com/blog/topics/ai-machine-learning",
+    # Anthropic
+    "https://www.anthropic.com/news",
+    "https://www.anthropic.com/research",
 ]
 
 # ===== OpenAI（要約） =====
@@ -269,8 +289,22 @@ SITE_RULES = {
     "techno-edge.net": {"include": [r"/\d{4}/\d{2}/\d{2}/", r"/article/"], "exclude": [r"/tag/", r"/category/", r"/author/"]},
     "b.hatena.ne.jp": {"hatena_special": True},
     "zenn.dev": {"include": [r"^/[^/]+/articles/[^/]+/?$", r"^/articles/[^/]+/?$"], "exclude": [r"^/users?/", r"^/topics/", r"^/books/", r"^/scraps/", r"^/tags?/"]},
-    "openai.com": {"include": [r"/news/"], "exclude": [r"/team/", r"/researchers/", r"/about/"]},
-    "news.microsoft.com": {"include": [r"/source/"], "exclude": [r"/people/", r"/about/"]},
+    "openai.com": {
+        "include": [r"/news/", r"/blog/"],
+        "exclude": [r"/team/", r"/researchers/", r"/about/"],
+    },
+    "news.microsoft.com": {
+        "include": [r"/source/"],
+        "exclude": [r"/people/", r"/about/"],
+    },
+    "blogs.microsoft.com": {
+        "include": [r"/ai/"],
+        "exclude": [r"/about/", r"/stories/"],
+    },
+    "azure.microsoft.com": {
+        "include": [r"/blog/"],
+        "exclude": [r"/support/"],
+    },
     "huggingface.co": {"include": [r"/blog/"], "exclude": [r"/authors?/"]},
 
     "ai-scholar.tech": {"include": [r"/ai_news/", r"/ai_trends/", r"/ai_book/", r"/ai_scholar/", r"/article/"], "exclude": [r"/category/", r"/tag/", r"/author/"]},
@@ -282,7 +316,6 @@ SITE_RULES = {
     "analyticsvidhya.com": {"include": [r"^/blog/\d{4}/\d{2}/[^/].*"], "exclude": [r"/category/", r"/tag/"]},
     "codezine.jp": {"include": [r"^/article/detail/\d+\.html$"], "exclude": [r"^/category/", r"^/tag/"]},
     "publickey1.jp": {"include": [r"^/blog/\d{4}/\d{2}/[^/].*\.html$"], "exclude": []},
-    # ==== ここから追加: Qiita ====
     "qiita.com": {
         "include": [r"^/[^/]+/items/[0-9a-fA-F]{20}$"],
         "exclude": [
@@ -294,7 +327,31 @@ SITE_RULES = {
             r"/comments?$",
         ],
     },
-    # ==== ここまで追加 ====
+    # Google: blog.google
+    "blog.google": {
+        "include": [r"/technology/ai/"],
+        "exclude": [r"/about/", r"/company/"],
+    },
+    # Google AI Blog (旧 Research Blog)
+    "ai.googleblog.com": {
+        "include": [r"^/\d{4}/\d{2}/[^/][^?#]*(?:\.html)?/?(?:\?.*)?$"],
+        "exclude": [],
+    },
+    # DeepMind
+    "deepmind.google": {
+        "include": [r"/blog/"],
+        "exclude": [r"/about/", r"/team/"],
+    },
+    # Google Cloud AI
+    "cloud.google.com": {
+        "include": [r"/blog/"],
+        "exclude": [r"/products/", r"/partners/"],
+    },
+    # Anthropic
+    "anthropic.com": {
+        "include": [r"/news/", r"/research/"],
+        "exclude": [r"/company/", r"/careers/"],
+    },
 }
 COMMON_EXCLUDES = [r"/author/", r"/users?/", r"/tag/", r"/category/", r"/topics/", r"/people/"]
 ZENN_ARTICLE_RE = re.compile(r"^/[^/]+/articles/[^/]+/?$")
@@ -315,13 +372,18 @@ ALLOW_NO_LIST_TIME = {
     "kaggle.com",
     "openai.com",
     "news.microsoft.com",
+    "blogs.microsoft.com",
+    "azure.microsoft.com",
     "huggingface.co",
     "zenn.dev",
     "business.nikkei.com",
     "xtech.nikkei.com",
-    # ==== ここから追加 ====
     "qiita.com",
-    # ==== ここまで追加 ====
+    "blog.google",
+    "ai.googleblog.com",
+    "deepmind.google",
+    "cloud.google.com",
+    "anthropic.com",
 }
 
 def score_link_by_rules(href: str, base_host_raw: str) -> int:
@@ -367,7 +429,7 @@ def pick_article_anchor(card, base_url: str) -> Optional[str]:
     if not anchors:
         return None
 
-    # ==== Qiita 専用: /ユーザー名/items/20桁hex のみ記事とみなす ====
+    # Qiita 専用: /ユーザー名/items/20桁hex のみ記事とみなす
     if base_host == "qiita.com":
         for a in anchors:
             href = normalize_url(urljoin(base_url, a["href"]))
@@ -375,7 +437,6 @@ def pick_article_anchor(card, base_url: str) -> Optional[str]:
             if re.match(r"^/[^/]+/items/[0-9a-fA-F]{20}$", path):
                 return href
         return None
-    # ==== ここまで Qiita ====
 
     # Zenn: 厳格＋短縮
     if base_host == "zenn.dev":
@@ -446,7 +507,7 @@ def extract_list_candidates(url: str, allowed_hosts: Optional[Set[str]] = None) 
 
     allowed_norm = {norm_host(h) for h in allowed_hosts} if allowed_hosts is not None else None
 
-    # カード候補要素を広めに取る（Zenn/日経の外し防止）
+    # カード候補要素を広めに取る
     candidates = soup.select("article, li, div, section, dd")
     if not candidates:
         candidates = soup.find_all(True)
@@ -504,7 +565,7 @@ def extract_list_candidates(url: str, allowed_hosts: Optional[Set[str]] = None) 
         for a in soup.find_all("a", href=True):
             faux = soup.new_tag("div")
             a_parent = a.parent or faux
-            a_parent.append(a)  # 疑似カード
+            a_parent.append(a)
             push_card(a_parent)
 
     return items
@@ -594,7 +655,7 @@ def extract_article(url: str) -> Dict:
         ogu = soup.find("meta", property="og:url")
         if (not canonical_url) and ogu and ogu.get("content"):
             canonical_url = ogu["content"]
-        amp = soup.find("link", rel=lambda x: x and "amphtml" in x)  # 参考値
+        amp = soup.find("link", rel=lambda x: x and "amphtml" in x)
     out["canonical_url"] = normalize_url(canonical_url) if canonical_url else ""
 
     # 公開日時抽出（meta, time, JSON-LD）
@@ -736,7 +797,7 @@ def summarize_article(title: str, url: str, body: str) -> str:
 {body_trim}
 """.strip()
         try:
-            resp = client.responses.create(model=OPENAI_MODEL, input=prompt)  # temperature等は既定
+            resp = client.responses.create(model=OPENAI_MODEL, input=prompt)
             return resp.output_text
         except Exception as e:
             print(f"[warn] OpenAI要約に失敗: {e} -> ローカル要約にフォールバック")
