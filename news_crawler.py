@@ -1,30 +1,27 @@
 # -*- coding: utf-8 -*-
 """
 ニュース一覧から「記事ページ」だけを正しくたどり、
-過去24時間（JST）に公開された記事の本文抽出＋要約（全件）を CSV/Markdown に保存します。
+過去 LOOKBACK_HOURS（JST）に公開された記事の本文抽出＋要約（全件）を CSV/Markdown に保存します。
 
-主な改善（2025-12版）
-- Zenn / Qiita を RSS(Atom) から取得（JSレンダリング問題を回避）
+✅ この版で解決していること
+- 元々の取得先（HTML一覧）は残したまま（消えない）
+- Zenn / Qiita は RSS/Atom から取得（JS依存・DOM変更に強い）
   - Zenn: https://zenn.dev/topics/<topic>/feed
-  - Qiita: https://qiita.com/tags/<tag>/feed.atom
-- OpenAI の /ja-JP/news/ は 403 になりやすいので公式RSS https://openai.com/news/rss.xml を使用
-- Anthropic は RSS が見つからない/404 のため Newsroom HTML を一覧として取得
-- Google AI Blog (ai.googleblog.com) は 404 のため blog.google / deepmind.google / research.google を追加
-- 同一 title の重複を除去（大小文字・空白・記号ゆらぎを正規化して判定）
-- Accept-Encoding を明示（zstd回避）、apparent_encoding で文字化け対策
-- trafilatura が空の場合は readability-lxml で本文抽出にフォールバック
-- Zenn は /{user}/articles/{slug} に加え /articles/{slug}（短縮URL）も許可（RSS経由でも対応）
-- KDnuggets のタグ/ニュースは /YYYY/MM/slug(.html)[/][?...] を記事と判定
-- 日経（business.nikkei.com / xtech.nikkei.com）は /atcl/ を最優先で取得
-- Towards Data Science は一覧が towardsdatascience.com、記事が medium.com 配下なので cross-host 許可
-- 一覧に時刻が無いサイトは記事ページ側で24h判定（ALLOW_NO_LIST_TIME）
-- URL正規化（utm除去・Medium冗長パラメータ除去）
-- 要約は OpenAI(Responses API, gpt-5-mini) → 失敗/未設定時はローカル要約にフォールバック
+  - Qiita: https://qiita.com/tags/<tag>/feed.atom / popular-items
+- Zennの日本語URLで落ちる（latin-1 codec）を修正
+  - Refererヘッダを送らない
+  - URLをASCII(パーセントエンコード)化してから requests
+- OpenAI / Microsoft / Google / Anthropic など「公式/準公式」も追加
+  - OpenAIは公式RSS https://openai.com/news/rss.xml（/ja-JP/news の 403 を回避）
+- RSS/Atom の XML パースが壊れるケース（BOM/制御文字/HTML返却）に耐性
+  - r.content を使って BOM/先頭制御文字を除去してからパース
+  - ElementTreeが失敗したら BeautifulSoup("xml") にフォールバック
+- 同じtitleは重複削除（候補段階 + 結果段階）
 """
 
 import os, re, time, datetime as dt, sys, logging, json
 from typing import List, Dict, Optional, Tuple, Set
-from urllib.parse import urljoin, urlparse, parse_qsl, urlencode
+from urllib.parse import urljoin, urlparse, parse_qsl, urlencode, urlsplit, urlunsplit, quote
 
 import requests
 from bs4 import BeautifulSoup
@@ -48,10 +45,9 @@ LOOKBACK_HOURS = int(os.environ.get("LOOKBACK_HOURS", "24"))  # 24h
 THRESHOLD = NOW - dt.timedelta(hours=LOOKBACK_HOURS)
 TIMEOUT = 25
 
-SLEEP_LIST = float(os.environ.get("SLEEP_LIST", "0.4"))       # 一覧ページ間待機
-SLEEP_ARTICLE = float(os.environ.get("SLEEP_ARTICLE", "0.6")) # 記事ページ間待機
-SLEEP_FEED = float(os.environ.get("SLEEP_FEED", "0.25"))      # フィード間待機
-
+SLEEP_LIST = float(os.environ.get("SLEEP_LIST", "0.35"))       # 一覧ページ間待機
+SLEEP_FEED = float(os.environ.get("SLEEP_FEED", "0.20"))       # フィード間待機
+SLEEP_ARTICLE = float(os.environ.get("SLEEP_ARTICLE", "0.55")) # 記事ページ間待機
 ARTICLE_CHARS_LIMIT = int(os.environ.get("ARTICLE_CHARS_LIMIT", "9000"))
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5-mini")
 OUT_DIR = os.environ.get("OUT_DIR", "out")
@@ -62,7 +58,7 @@ os.environ["DATE_PREFIX"] = DATE_PREFIX
 CSV_PATH = os.path.join(OUT_DIR, f"{DATE_PREFIX}_news_{LOOKBACK_HOURS}h_fulltext.csv")
 MD_PATH  = os.path.join(OUT_DIR, f"{DATE_PREFIX}_news_{LOOKBACK_HOURS}h_fulltext.md")
 
-# ===== ユーティリティ：ホスト名正規化 / URL正規化 =====
+# ===== ユーティリティ：ホスト名正規化 / URL正規化 / タイトル正規化 =====
 def norm_host(host: str) -> str:
     h = (host or "").lower()
     if h.startswith("www."):
@@ -94,7 +90,15 @@ def normalize_title(t: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
-# ===== 対象「一覧」ページ（元の取得先は維持しつつ追加） =====
+def ascii_url(u: str) -> str:
+    """日本語など非ASCIIを含むURLをrequestsで安全に扱える形にする"""
+    p = urlsplit(u)
+    path = quote(p.path, safe="/%")
+    query = quote(p.query, safe="=&%")
+    frag = quote(p.fragment, safe="%")
+    return urlunsplit((p.scheme, p.netloc, path, query, frag))
+
+# ===== 対象「一覧」ページ（元のまま維持 + 追加） =====
 TARGET_LIST_PAGES = [
     # --- 元の取得先（維持） ---
     "https://business.nikkei.com/latest/?i_cid=nbpnb_latest",
@@ -107,6 +111,12 @@ TARGET_LIST_PAGES = [
     "https://www.techno-edge.net/special/557/recent/%E7%94%9F%E6%88%90AI%E3%82%A6%E3%82%A3%E3%83%BC%E3%82%AF%E3%83%AA%E3%83%BC",
     "https://b.hatena.ne.jp/hotentry/it",
     "https://b.hatena.ne.jp/entrylist/it/AI%E3%83%BB%E6%A9%9F%E6%A2%B0%E5%AD%A6%E7%BF%92",
+    "https://zenn.dev/topics/%E6%A9%9F%E6%A2%B0%E5%AD%A6%E7%BF%92",
+    "https://zenn.dev/topics/ai",
+    "https://zenn.dev/topics/deeplearning",
+    "https://zenn.dev/topics/nlp",
+    "https://zenn.dev/topics/python",
+    "https://news.microsoft.com/source/topics/ai/",
     "https://huggingface.co/blog",
     "https://ai-scholar.tech/",
     "https://competition-content.signate.jp/articles",
@@ -132,34 +142,29 @@ TARGET_LIST_PAGES = [
     "https://codezine.jp/case/",
     "https://www.publickey1.jp/",
 
-    # --- 追加：公式/準公式（AI関連） ---
-    # Microsoft
-    "https://news.microsoft.com/source/topics/ai/",
+    # --- 追加（公式/準公式 AI ニュース） ---
+    # OpenAI HTMLは403が出やすいのでRSSで取得（下のFEEDで対応）
+    # Microsoft (公式AIブログ)
     "https://www.microsoft.com/en-us/ai/blog/",
-    # Anthropic（RSSが404だったため Newsroom HTML をスクレイプ）
+    # Anthropic (newsroom)
     "https://www.anthropic.com/news",
-    # Google / DeepMind / Research（ai.googleblog.com は 404 だったので置換）
+    # Google / DeepMind / Research
     "https://blog.google/technology/ai/",
     "https://blog.google/technology/google-deepmind/",
     "https://deepmind.google/blog/",
     "https://research.google/blog/",
 ]
 
-# ===== RSS/Atom フィード（Zenn/Qiita/OpenAI など） =====
-ZENN_TOPICS = [
-    "ai", "deeplearning", "nlp", "python", "機械学習"
-]
-QIITA_TAGS = [
-    "ai", "machinelearning", "deeplearning", "nlp", "python", "llm"
-]
+# ===== 追加：RSS/Atom（Zenn/Qiita/OpenAI など） =====
+ZENN_TOPICS = ["ai", "deeplearning", "nlp", "python", "機械学習"]
+QIITA_TAGS = ["ai", "machinelearning", "deeplearning", "nlp", "python", "llm", "生成ai"]
 
-FEED_URLS = [
-    # OpenAI（公式RSS）
-    {"url": "https://openai.com/news/rss.xml", "source": "openai_news_rss"},
+FEED_URLS: List[Dict] = []
 
-    # Zenn（topics feed）
-    {"url": "https://zenn.dev/feed", "source": "zenn_global"},
-]
+# OpenAI（公式RSS）
+FEED_URLS.append({"url": "https://openai.com/news/rss.xml", "source": "openai_news_rss"})
+
+# Zenn（topics feed）
 for tp in ZENN_TOPICS:
     FEED_URLS.append({"url": f"https://zenn.dev/topics/{tp}/feed", "source": f"zenn_topic:{tp}"})
 
@@ -188,34 +193,38 @@ UA = (
 )
 DEFAULT_HEADERS = {
     "User-Agent": UA,
-    "Referer": "",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Encoding": "gzip, deflate, br",
     "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
 }
 
 def req(url: str, accept_xml: bool = False) -> Optional[requests.Response]:
-    """403対策でUAを変えて一度だけ再試行。XML取得時は Accept を寄せる。"""
+    """
+    403対策でUAを変えて一度だけ再試行。
+    非ASCII URLも安全に処理（latin-1 ヘッダ事故回避）:
+      - Referer を送らない
+      - URL をASCII化(パーセントエンコード)してから requests
+    """
     try:
+        safe_url = ascii_url(url)
+
         headers = DEFAULT_HEADERS.copy()
-        headers["Referer"] = url
         if accept_xml:
             headers["Accept"] = "application/rss+xml, application/atom+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.7"
 
-        r = requests.get(url, headers=headers, timeout=TIMEOUT)
+        r = requests.get(safe_url, headers=headers, timeout=TIMEOUT)
         if r.status_code == 403:
             headers["User-Agent"] = (
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
             )
-            r = requests.get(url, headers=headers, timeout=TIMEOUT)
+            r = requests.get(safe_url, headers=headers, timeout=TIMEOUT)
 
         if r.status_code != 200:
             print(f"[warn] HTTP {r.status_code}: {url}")
             return None
 
-        if not r.encoding or r.encoding.lower() in ("ascii", "latin-1"):
-            r.encoding = r.apparent_encoding or "utf-8"
+        # encodingは必要なときだけ下流で決める（RSSは content から処理）
         return r
     except Exception as e:
         print(f"[error] request failed: {url} -> {e}")
@@ -223,6 +232,8 @@ def req(url: str, accept_xml: bool = False) -> Optional[requests.Response]:
 
 def soup_from_response(r: requests.Response) -> BeautifulSoup:
     try:
+        if not r.encoding or r.encoding.lower() in ("ascii", "latin-1"):
+            r.encoding = r.apparent_encoding or "utf-8"
         html = r.text
         if not html or len(html) < 100:
             html = r.content.decode(r.apparent_encoding or "utf-8", errors="replace")
@@ -254,11 +265,11 @@ MONTHS = {m.lower(): i for i, m in enumerate(
     ["January","February","March","April","May","June","July","August","September","October","November","December"], 1)}
 
 def parse_datetime_text(s: str, base: dt.datetime) -> Optional[dt.datetime]:
-    s = s.strip() if s else ""
+    s = (s or "").strip()
     if not s:
         return None
 
-    # dateutil でいけるものは先に処理（RSS/Atomの pubDate/updated など）
+    # RSS/Atomの日時などは dateutil で先に試す
     try:
         d = dtparse(s)
         if d.tzinfo is None:
@@ -281,37 +292,29 @@ def parse_datetime_text(s: str, base: dt.datetime) -> Optional[dt.datetime]:
         m = pat.search(s)
         if m:
             y, mo, d = map(int, m.groups())
-            try:
-                return dt.datetime(y, mo, d, tzinfo=JST)
-            except Exception:
-                pass
+            try: return dt.datetime(y, mo, d, tzinfo=JST)
+            except: pass
 
     m = ABS[2].search(s)
     if m:
         mo, d = map(int, m.groups())
-        try:
-            return dt.datetime(NOW.year, mo, d, tzinfo=JST)
-        except Exception:
-            pass
+        try: return dt.datetime(NOW.year, mo, d, tzinfo=JST)
+        except: pass
 
     m = ABS[3].search(s)
     if m:
         mon = MONTHS.get(m.group(1).lower(), 0)
         d = int(m.group(2)); y = int(m.group(3))
         if mon:
-            try:
-                return dt.datetime(y, mon, d, tzinfo=JST)
-            except Exception:
-                pass
+            try: return dt.datetime(y, mon, d, tzinfo=JST)
+            except: pass
 
     m = ABS[4].search(s)
     if m:
         d = int(m.group(1)); mon = MONTHS.get(m.group(2).lower(), 0); y = int(m.group(3))
         if mon:
-            try:
-                return dt.datetime(y, mon, d, tzinfo=JST)
-            except Exception:
-                pass
+            try: return dt.datetime(y, mon, d, tzinfo=JST)
+            except: pass
 
     m = re.search(r"(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})(:\d{2})?(Z|[+\-]\d{2}:\d{2})?", s)
     if m:
@@ -319,7 +322,7 @@ def parse_datetime_text(s: str, base: dt.datetime) -> Optional[dt.datetime]:
         hh, mm = map(int, m.group(2).split(":"))
         try:
             return dt.datetime(y, mo, d, hh, mm, 0, tzinfo=JST)
-        except Exception:
+        except:
             pass
 
     return None
@@ -345,14 +348,9 @@ SITE_RULES = {
     "techno-edge.net": {"include": [r"/\d{4}/\d{2}/\d{2}/", r"/article/"], "exclude": [r"/tag/", r"/category/", r"/author/"]},
     "b.hatena.ne.jp": {"hatena_special": True},
     "zenn.dev": {"include": [r"^/[^/]+/articles/[^/]+/?$", r"^/articles/[^/]+/?$"], "exclude": [r"^/users?/", r"^/topics/", r"^/books/", r"^/scraps/", r"^/tags?/"]},
-    "qiita.com": {"include": [r"^/[^/]+/items/[0-9a-f]{20,}"], "exclude": [r"^/tags/", r"^/search", r"^/organizations", r"^/advent-calendar"]},
-
-    # OpenAI は RSS 推奨（HTMLは403回避のため）
     "openai.com": {"include": [r"^/news/"], "exclude": [r"/team/", r"/researchers/", r"/about/"]},
-
     "news.microsoft.com": {"include": [r"^/source/"], "exclude": [r"/people/", r"/about/"]},
     "microsoft.com": {"include": [r"^/en-us/ai/blog/"], "exclude": []},
-
     "huggingface.co": {"include": [r"/blog/"], "exclude": [r"/authors?/"]},
     "ai-scholar.tech": {"include": [r"/ai_news/", r"/ai_trends/", r"/ai_book/", r"/ai_scholar/", r"/article/"], "exclude": [r"/category/", r"/tag/", r"/author/"]},
     "competition-content.signate.jp": {"include": [r"^/articles/[^/]+/?$"], "exclude": [r"/users?/", r"/tags?/"]},
@@ -363,16 +361,11 @@ SITE_RULES = {
     "analyticsvidhya.com": {"include": [r"^/blog/\d{4}/\d{2}/[^/].*"], "exclude": [r"/category/", r"/tag/"]},
     "codezine.jp": {"include": [r"^/article/detail/\d+\.html$"], "exclude": [r"^/category/", r"^/tag/"]},
     "publickey1.jp": {"include": [r"^/blog/\d{4}/\d{2}/[^/].*\.html$"], "exclude": []},
-
-    # Anthropic Newsroom
-    "anthropic.com": {"include": [r"^/news/"], "exclude": [r"/research", r"/careers", r"/policy"]},
-
-    # Google
+    "anthropic.com": {"include": [r"^/news/"], "exclude": [r"/careers", r"/policy", r"/research"]},
     "blog.google": {"include": [r"^/technology/"], "exclude": [r"/about/"]},
     "deepmind.google": {"include": [r"^/blog/"], "exclude": []},
     "research.google": {"include": [r"^/blog/"], "exclude": []},
 }
-
 COMMON_EXCLUDES = [r"/author/", r"/users?/", r"/tag/", r"/category/", r"/topics/", r"/people/"]
 ZENN_ARTICLE_RE = re.compile(r"^/[^/]+/articles/[^/]+/?$")
 ZENN_USERLESS_RE = re.compile(r"^/articles/[^/]+/?$")
@@ -390,17 +383,17 @@ ALLOW_NO_LIST_TIME = {
     "medium.com",
     "analyticsvidhya.com",
     "kaggle.com",
+    "openai.com",
     "news.microsoft.com",
     "huggingface.co",
     "zenn.dev",
-    "qiita.com",
     "business.nikkei.com",
     "xtech.nikkei.com",
+    "microsoft.com",
+    "anthropic.com",
     "blog.google",
     "deepmind.google",
     "research.google",
-    "anthropic.com",
-    "microsoft.com",
 }
 
 def score_link_by_rules(href: str, base_host_raw: str) -> int:
@@ -473,7 +466,6 @@ def pick_article_anchor(card, base_url: str) -> Optional[str]:
                 if any(re.search(pat, path) for pat in COMMON_EXCLUDES):
                     continue
                 return href
-        # 見つからなければ通常スコアリングへ
 
     # 一般スコアリング
     best_href, best_score = None, -10**9
@@ -504,10 +496,11 @@ def pick_article_anchor(card, base_url: str) -> Optional[str]:
                 return None
     return best_href
 
-# ===== 一覧抽出 =====
+# ===== 一覧抽出（HTML） =====
 def extract_list_candidates(url: str, allowed_hosts: Optional[Set[str]] = None) -> List[Dict]:
     r = req(url)
-    if not r: return []
+    if not r:
+        return []
     soup = soup_from_response(r)
     items, seen = [], set()
     base_host_raw = urlparse(url).netloc
@@ -573,7 +566,10 @@ def extract_list_candidates(url: str, allowed_hosts: Optional[Set[str]] = None) 
         for a in soup.find_all("a", href=True):
             faux = soup.new_tag("div")
             a_parent = a.parent or faux
-            a_parent.append(a)
+            try:
+                a_parent.append(a)
+            except Exception:
+                pass
             push_card(a_parent)
 
     return items
@@ -589,35 +585,14 @@ def collect_from_list(url: str) -> List[Dict]:
         allowed = CROSS_HOST_ALLOW[base_host]
     return extract_list_candidates(url, allowed_hosts=allowed)
 
-# ===== RSS/Atom 取り込み =====
-def _xml_text(el: Optional[ET.Element]) -> str:
-    if el is None:
-        return ""
-    return (el.text or "").strip()
-
-def parse_feed_items(feed_url: str) -> List[Dict]:
-    r = req(feed_url, accept_xml=True)
-    if not r:
-        return []
-    xml = r.text.strip()
-    if not xml:
-        return []
-    try:
-        root = ET.fromstring(xml)
-    except Exception:
-        # まれに BOM/変な文字で壊れるのでバイトから再挑戦
-        try:
-            root = ET.fromstring(r.content)
-        except Exception as e:
-            print(f"[warn] feed parse failed: {feed_url} -> {e}")
-            return []
-
-    # namespace 対応（Atomは {http://www.w3.org/2005/Atom} が付く）
+# ===== RSS/Atom パース（壊れ対策込み） =====
+def _parse_root_to_items(root: ET.Element) -> List[Dict]:
     def strip_ns(tag: str) -> str:
         return tag.split("}", 1)[-1] if "}" in tag else tag
 
-    items = []
-    # RSS2: channel/item
+    items: List[Dict] = []
+
+    # RSS2
     if strip_ns(root.tag).lower() in ("rss", "rdf", "rdf:rdf"):
         channel = None
         for ch in list(root):
@@ -626,40 +601,44 @@ def parse_feed_items(feed_url: str) -> List[Dict]:
                 break
         if channel is None:
             channel = root
+
         for it in channel.findall(".//item"):
-            title = _xml_text(it.find("title"))
-            link = _xml_text(it.find("link"))
-            pub = _xml_text(it.find("pubDate")) or _xml_text(it.find("date"))
+            title = (it.findtext("title") or "").strip()
+            link = (it.findtext("link") or "").strip()
+            pub = (it.findtext("pubDate") or it.findtext("date") or "").strip()
             if not link:
-                guid = _xml_text(it.find("guid"))
+                guid = (it.findtext("guid") or "").strip()
                 if guid.startswith("http"):
                     link = guid
             if title and link:
                 items.append({"title": title, "link": normalize_url(link), "published_raw": pub})
         return items
 
-    # Atom: feed/entry
+    # Atom
     if strip_ns(root.tag).lower() == "feed":
-        for ent in root.findall(".//{http://www.w3.org/2005/Atom}entry"):
-            title = _xml_text(ent.find("{http://www.w3.org/2005/Atom}title"))
-            pub = _xml_text(ent.find("{http://www.w3.org/2005/Atom}published"))
-            upd = _xml_text(ent.find("{http://www.w3.org/2005/Atom}updated"))
-            # link は rel="alternate" 優先
+        ns = "{http://www.w3.org/2005/Atom}"
+        for ent in root.findall(f".//{ns}entry"):
+            title = (ent.findtext(f"{ns}title") or "").strip()
+            pub = (ent.findtext(f"{ns}published") or "").strip()
+            upd = (ent.findtext(f"{ns}updated") or "").strip()
+
             link = ""
-            links = ent.findall("{http://www.w3.org/2005/Atom}link")
-            for lk in links:
+            for lk in ent.findall(f"{ns}link"):
                 rel = (lk.get("rel") or "alternate").lower()
                 href = lk.get("href") or ""
                 if rel == "alternate" and href:
                     link = href
                     break
-            if (not link) and links:
-                link = links[0].get("href") or ""
+            if not link:
+                lks = ent.findall(f"{ns}link")
+                if lks:
+                    link = lks[0].get("href") or ""
+
             if title and link:
                 items.append({"title": title, "link": normalize_url(link), "published_raw": pub or upd})
         return items
 
-    # その他フォーマットは軽く探す
+    # その他（最低限）
     for ent in root.findall(".//*"):
         if strip_ns(ent.tag).lower() == "entry":
             title = ""
@@ -668,34 +647,82 @@ def parse_feed_items(feed_url: str) -> List[Dict]:
             for ch in list(ent):
                 tg = strip_ns(ch.tag).lower()
                 if tg == "title":
-                    title = _xml_text(ch)
+                    title = (ch.text or "").strip()
                 elif tg == "link":
-                    link = ch.get("href") or _xml_text(ch)
+                    link = ch.get("href") or (ch.text or "").strip()
                 elif tg in ("published", "updated", "pubdate", "date"):
-                    pub = _xml_text(ch)
+                    pub = (ch.text or "").strip()
             if title and link:
                 items.append({"title": title, "link": normalize_url(link), "published_raw": pub})
     return items
 
+def parse_feed_items(feed_url: str) -> List[Dict]:
+    r = req(feed_url, accept_xml=True)
+    if not r:
+        return []
+
+    raw = r.content or b""
+    if not raw:
+        return []
+
+    # UTF-8 BOM除去 + 先頭空白/制御文字除去
+    raw = raw.lstrip(b"\xef\xbb\xbf").lstrip()
+
+    # ETで挑戦
+    try:
+        root = ET.fromstring(raw)
+        return _parse_root_to_items(root)
+    except Exception as e1:
+        # フォールバック：BeautifulSoup(xml) で救済
+        try:
+            soup = BeautifulSoup(raw, "xml")
+            items: List[Dict] = []
+            for node in soup.find_all(["item", "entry"]):
+                title = (node.find("title").get_text(strip=True) if node.find("title") else "").strip()
+                link = ""
+                lk = node.find("link")
+                if lk:
+                    link = lk.get("href") or lk.get_text(strip=True) or ""
+                pub = ""
+                for tag_name in ["pubDate", "published", "updated", "dc:date", "date"]:
+                    t = node.find(tag_name)
+                    if t and t.get_text(strip=True):
+                        pub = t.get_text(strip=True)
+                        break
+                if title and link and link.startswith("http"):
+                    items.append({"title": title, "link": normalize_url(link), "published_raw": pub})
+            if items:
+                return items
+        except Exception:
+            pass
+
+        print(f"[warn] feed parse failed: {feed_url} -> {e1}")
+        return []
+
 def collect_from_feed(feed: Dict) -> List[Dict]:
     url = feed["url"]
-    src = feed.get("source", url)
     print(f"🧾 Feed: {url}")
     items = parse_feed_items(url)
-    out = []
+
+    out: List[Dict] = []
     for it in items:
-        pub_dt = parse_datetime_text(it.get("published_raw",""), NOW)
-        if pub_dt and not within_lookback(pub_dt):
+        title = (it.get("title") or "").strip()
+        link = normalize_url(it.get("link") or "")
+        if not title or not link.startswith("http"):
             continue
-        # フィードは list_time_guess に published を載せる（無ければ空）
+
+        pub_dt = parse_datetime_text(it.get("published_raw",""), NOW)
+
+        # feedは日付があればlist_time_guessに載せる。無い場合は空（後段で記事側で判定）
         out.append({
             "source_list": url,
-            "title": (it.get("title") or "").strip(),
-            "link": normalize_url(it.get("link") or ""),
+            "title": title,
+            "link": link,
             "list_time_guess": pub_dt.isoformat() if pub_dt else "",
             "list_time_raw": it.get("published_raw",""),
         })
-    print(f"  -> {len(out)} items (within lookback or no date)")
+
+    print(f"  -> {len(out)} items")
     return out
 
 # ===== 本文抽出（trafilatura → readability → p連結） =====
@@ -723,7 +750,7 @@ def extract_article(url: str) -> Dict:
     # requests失敗時はURLダウンローダ
     if not r:
         try:
-            downloaded = fetch_url(url)
+            downloaded = fetch_url(ascii_url(url))
             if downloaded:
                 ttext = trafi_extract(downloaded, include_comments=False, favor_recall=True, with_metadata=True)
                 if ttext:
@@ -791,16 +818,20 @@ def extract_article(url: str) -> Dict:
         ]
         for sel in metas:
             m = soup.find(*sel)
-            if m and m.get("content"): time_texts.append(m["content"])
+            if m and m.get("content"):
+                time_texts.append(m["content"])
         for el in soup.select("time"):
-            if el.get("datetime"): time_texts.append(el["datetime"])
-            txtt = tx(el)
-            if txtt: time_texts.append(txtt)
+            if el.get("datetime"):
+                time_texts.append(el["datetime"])
+            ttxt = tx(el)
+            if ttxt:
+                time_texts.append(ttxt)
         for cls in ["time","date","timestamp","modDate","update","c-article__time","c-card__time","pubdate"]:
             el = soup.find(class_=cls)
             if el:
-                txtc = tx(el)
-                if txtc: time_texts.append(txtc)
+                ttxt = tx(el)
+                if ttxt:
+                    time_texts.append(ttxt)
         for sc in soup.find_all("script", type=lambda t: t and "ld+json" in t):
             try:
                 data = json.loads(sc.string or "")
@@ -831,7 +862,8 @@ def extract_article(url: str) -> Dict:
                                 found.append(v)
                             dfs(v, found)
                     elif isinstance(o, list):
-                        for x in o: dfs(x, found)
+                        for x in o:
+                            dfs(x, found)
                 bag = []
                 dfs(data, bag)
                 for s in bag:
@@ -845,7 +877,6 @@ def extract_article(url: str) -> Dict:
 
     out["published_dt"] = cand_dt
     out["published_raw"] = best_src
-
     return out
 
 # ===== 要約（OpenAI → ローカル） =====
@@ -863,7 +894,8 @@ def local_fallback_summary(title: str, url: str, body: str) -> str:
             if lw in {"https","http","www","com"}:
                 continue
             top.append(w)
-            if len(top) >= 5: break
+            if len(top) >= 5:
+                break
     bullets = "\n".join([f"- ポイント: {w}" for w in top]) if top else "- ポイント: 主要事項は本文参照"
     if not gist:
         gist = f"{title} の要点を簡易にまとめました。本文抽出が十分でない可能性があります。"
@@ -899,12 +931,39 @@ def summarize_article(title: str, url: str, body: str) -> str:
             print(f"[warn] OpenAI要約に失敗: {e} -> ローカル要約にフォールバック")
     return local_fallback_summary(title, url, body)
 
+# ===== 重複削除（title単位：新しい方を残す） =====
+def pick_newer_by_time(a: Dict, b: Dict, time_key: str) -> Dict:
+    """aとbを比較して time_key が新しい方を返す（片方が無い場合はある方優先）"""
+    ta = a.get(time_key) or ""
+    tb = b.get(time_key) or ""
+    if ta and tb:
+        return a if ta >= tb else b
+    if ta and not tb:
+        return a
+    if tb and not ta:
+        return b
+    return a  # 両方なしなら先勝ち
+
+def dedupe_by_title_keep_latest(rows: List[Dict], time_key: str) -> List[Dict]:
+    best: Dict[str, Dict] = {}
+    for r in rows:
+        t_raw = (r.get("title") or "").strip()
+        if not t_raw:
+            continue
+        key = normalize_title(t_raw)
+        if key not in best:
+            best[key] = r
+        else:
+            best[key] = pick_newer_by_time(best[key], r, time_key=time_key)
+    return list(best.values())
+
 # ===== メイン =====
 def main():
     print(f"[info] NOW (JST): {NOW.isoformat()} / lookback: {LOOKBACK_HOURS}h")
 
-    # 1) 一覧から候補収集（元の取得先）
     candidates: List[Dict] = []
+
+    # 1) HTML一覧から候補収集（元々の取得先を維持）
     for lp in TARGET_LIST_PAGES:
         print(f"🔎 List: {lp}")
         rows = collect_from_list(lp)
@@ -912,56 +971,41 @@ def main():
         candidates.extend(rows)
         time.sleep(SLEEP_LIST)
 
-    # 2) フィードから候補収集（Zenn/Qiita/OpenAI）
+    # 2) RSS/Atomから候補収集（Zenn/Qiita/OpenAI）
     for fd in FEED_URLS:
         rows = collect_from_feed(fd)
         candidates.extend(rows)
         time.sleep(SLEEP_FEED)
 
-    # 3) 重複除去（まず link 正規化、次に同一 title を潰す）
-    #    - 同一 title は 1件にまとめる（publishedが新しい方を優先）
-    by_title: Dict[str, Dict] = {}
+    # 3) 候補：URL正規化してから title で重複削除（list_time_guess が新しい方）
     for r in candidates:
         r["link"] = normalize_url(r.get("link",""))
-        t = (r.get("title") or "").strip()
-        if not t or not r["link"]:
-            continue
-        key = normalize_title(t)
-        # 比較用 published
-        cand_dt = None
-        if r.get("list_time_guess"):
-            try:
-                cand_dt = dt.datetime.fromisoformat(r["list_time_guess"])
-            except Exception:
-                cand_dt = parse_datetime_text(r.get("list_time_raw",""), NOW)
-        if key not in by_title:
-            by_title[key] = r
-        else:
-            # 新しい方を残す（日時不明なら既存優先）
-            ex = by_title[key]
-            ex_dt = None
-            if ex.get("list_time_guess"):
-                try:
-                    ex_dt = dt.datetime.fromisoformat(ex["list_time_guess"])
-                except Exception:
-                    ex_dt = parse_datetime_text(ex.get("list_time_raw",""), NOW)
-            if cand_dt and (ex_dt is None or cand_dt > ex_dt):
-                by_title[key] = r
+        r["title"] = (r.get("title") or "").strip()
 
-    uniq = list(by_title.values())
-    print(f"\n🧮 Unique candidates (dedup by title): {len(uniq)}")
+    candidates = dedupe_by_title_keep_latest(candidates, time_key="list_time_guess")
+    print(f"\n🧮 Unique candidates (dedup by title): {len(candidates)}")
 
-    # 4) 本文抽出 & 24h再判定 & 要約
-    results = []
-    for i, it in enumerate(uniq, 1):
+    # 4) 本文抽出 & lookback再判定 & 要約
+    results: List[Dict] = []
+    for i, it in enumerate(candidates, 1):
         url = it["link"]
         title = it["title"]
-        print(f"\n🌐 [{i}/{len(uniq)}] {title[:60]} ...")
+        if not url.startswith("http"):
+            continue
+
+        print(f"\n🌐 [{i}/{len(candidates)}] {title[:60]} ...")
         art = extract_article(url)
 
-        pub_dt = art["published_dt"] or (dt.datetime.fromisoformat(it["list_time_guess"]) if it.get("list_time_guess") else None)
+        # 公開日時: 記事側が取れればそれ、無ければ一覧(=feed含む)推定
+        pub_dt = art["published_dt"]
+        if not pub_dt and it.get("list_time_guess"):
+            try:
+                pub_dt = dt.datetime.fromisoformat(it["list_time_guess"])
+            except Exception:
+                pub_dt = None
+
         if not within_lookback(pub_dt):
-            print("  -> Skip (older than lookback)")
+            print("  -> Skip (older than lookback or time unknown)")
             time.sleep(SLEEP_ARTICLE)
             continue
 
@@ -971,10 +1015,10 @@ def main():
             cu = urlparse(art["canonical_url"])
             uh = norm_host(urlparse(url).netloc)
             ch = norm_host(cu.netloc)
-            if (uh == ch) or (uh in CROSS_HOST_ALLOW and ch in CROSS_HOST_ALLOW[uh]):
+            if (uh == ch) or (uh in CROSS_HOST_ALLOW and ch in CROSS_HOST_ALLOW.get(uh, set())):
                 final_url = art["canonical_url"]
 
-        title_use = art["title_override"] or title
+        title_use = (art["title_override"] or title).strip()
         body = art["text"] or ""
         summary = summarize_article(title_use, final_url, body)
 
@@ -990,7 +1034,10 @@ def main():
         })
         time.sleep(SLEEP_ARTICLE)
 
-    # 5) 保存
+    # 5) 結果：titleで重複削除（published_at が新しい方）
+    results = dedupe_by_title_keep_latest(results, time_key="published_at")
+
+    # 6) 保存
     df = pd.DataFrame(results)
     if not df.empty:
         df.sort_values("published_at", ascending=False, inplace=True)
@@ -1008,6 +1055,7 @@ def main():
         if r['summary']:
             lines.append("\n" + r['summary'])
         lines.append("\n---\n")
+
     with open(MD_PATH, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
