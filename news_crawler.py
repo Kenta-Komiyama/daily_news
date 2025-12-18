@@ -1,18 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-ニュース一覧から「記事ページ」だけを正しくたどり、
+ニュース一覧（HTML） + RSS/Atom から記事候補を集め、
 過去 LOOKBACK_HOURS（JST）に公開された記事の本文抽出＋要約（全件）を CSV/Markdown に保存します。
 
-✅ この版で解決していること
-- 元々の取得先（HTML一覧）は残したまま（消えない）
-- Business Insider の記事が一覧で時刻を拾えず 0 件になる問題を修正
-  - ALLOW_NO_LIST_TIME に businessinsider.jp を追加（一覧時刻が無くても候補に残す）
-  - カード全体/リンクテキストも meta 候補に追加して時刻を拾いやすく
-- Zenn / Qiita は RSS/Atom から取得（JS依存・DOM変更に強い）
-- Zennの日本語URLで落ちる（latin-1 codec）を修正（Refererを送らない＋URL ASCII化）
-- OpenAI RSS の XML パース失敗（BOM/制御文字/HTML返却）耐性（ET→BS(xml)フォールバック）
-- OpenAI / Microsoft / Google / Anthropic など公式/準公式も追加
-- 同じtitleは重複削除（候補段階 + 結果段階）
+✅ 改善点（今回）
+- Publickey / Analytics Vidhya / Towards Data Science が取れない問題：
+  -> RSS/Atom を追加して安定取得
+- Towards Data Science（towardsdatascience.com）一覧から medium.com 記事を拾う際の
+  スコアリング規則が効かないバグを修正（rules_host を link_host に切替）
+- Business Insider のカテゴリ一覧で時刻を拾えず 0 件になる問題を維持修正
+- Zenn 日本語feed URLで latin-1 codec 事故を回避（Referer無送信 + URL ASCII化）
+- OpenAI RSS が壊れ/HTML返却でも落ちにくい（ET → BeautifulSoup(xml)フォールバック）
+- title 重複は「候補段階」「結果段階」で削除（新しい方を残す）
 """
 
 import os, re, time, datetime as dt, sys, logging, json
@@ -40,13 +39,13 @@ for name in ["trafilatura", "trafilatura.core", "trafilatura.utils"]:
 # ===== 基本設定 =====
 JST = tz.gettz("Asia/Tokyo")
 NOW = dt.datetime.now(JST)
-LOOKBACK_HOURS = int(os.environ.get("LOOKBACK_HOURS", "24"))  # 24h
+LOOKBACK_HOURS = int(os.environ.get("LOOKBACK_HOURS", "24"))
 THRESHOLD = NOW - dt.timedelta(hours=LOOKBACK_HOURS)
 TIMEOUT = 25
 
-SLEEP_LIST = float(os.environ.get("SLEEP_LIST", "0.35"))       # 一覧ページ間待機
-SLEEP_FEED = float(os.environ.get("SLEEP_FEED", "0.20"))       # フィード間待機
-SLEEP_ARTICLE = float(os.environ.get("SLEEP_ARTICLE", "0.55")) # 記事ページ間待機
+SLEEP_LIST = float(os.environ.get("SLEEP_LIST", "0.35"))
+SLEEP_FEED = float(os.environ.get("SLEEP_FEED", "0.20"))
+SLEEP_ARTICLE = float(os.environ.get("SLEEP_ARTICLE", "0.55"))
 ARTICLE_CHARS_LIMIT = int(os.environ.get("ARTICLE_CHARS_LIMIT", "9000"))
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5-mini")
 OUT_DIR = os.environ.get("OUT_DIR", "out")
@@ -57,7 +56,7 @@ os.environ["DATE_PREFIX"] = DATE_PREFIX
 CSV_PATH = os.path.join(OUT_DIR, f"{DATE_PREFIX}_news_{LOOKBACK_HOURS}h_fulltext.csv")
 MD_PATH  = os.path.join(OUT_DIR, f"{DATE_PREFIX}_news_{LOOKBACK_HOURS}h_fulltext.md")
 
-# ===== ユーティリティ：ホスト名正規化 / URL正規化 / タイトル正規化 =====
+# ===== ユーティリティ =====
 def norm_host(host: str) -> str:
     h = (host or "").lower()
     if h.startswith("www."):
@@ -90,16 +89,15 @@ def normalize_title(t: str) -> str:
     return s
 
 def ascii_url(u: str) -> str:
-    """日本語など非ASCIIを含むURLをrequestsで安全に扱える形にする"""
+    """非ASCIIを含むURLを安全にrequestsへ渡す（Zenn日本語feed等対策）"""
     p = urlsplit(u)
     path = quote(p.path, safe="/%")
     query = quote(p.query, safe="=&%")
     frag = quote(p.fragment, safe="%")
     return urlunsplit((p.scheme, p.netloc, path, query, frag))
 
-# ===== 対象「一覧」ページ（元のまま維持 + 追加） =====
+# ===== 対象「一覧」ページ（元の取得先は維持） =====
 TARGET_LIST_PAGES = [
-    # --- 元の取得先（維持） ---
     "https://business.nikkei.com/latest/?i_cid=nbpnb_latest",
     "https://www.businessinsider.jp/category/business/",
     "https://www.businessinsider.jp/category/tech-news/",
@@ -115,8 +113,18 @@ TARGET_LIST_PAGES = [
     "https://zenn.dev/topics/deeplearning",
     "https://zenn.dev/topics/nlp",
     "https://zenn.dev/topics/python",
+
+    # 公式/準公式 AI
     "https://news.microsoft.com/source/topics/ai/",
     "https://huggingface.co/blog",
+    "https://www.microsoft.com/en-us/ai/blog/",
+    "https://www.anthropic.com/news",
+    "https://blog.google/technology/ai/",
+    "https://blog.google/technology/google-deepmind/",
+    "https://deepmind.google/blog/",
+    "https://research.google/blog/",
+
+    # データ/DS系
     "https://ai-scholar.tech/",
     "https://competition-content.signate.jp/articles",
     "https://www.kaggle.com/blog?sort=hotness",
@@ -140,27 +148,29 @@ TARGET_LIST_PAGES = [
     "https://codezine.jp/data/",
     "https://codezine.jp/case/",
     "https://www.publickey1.jp/",
-
-    # --- 追加（公式/準公式 AI ニュース） ---
-    "https://www.microsoft.com/en-us/ai/blog/",
-    "https://www.anthropic.com/news",
-    "https://blog.google/technology/ai/",
-    "https://blog.google/technology/google-deepmind/",
-    "https://deepmind.google/blog/",
-    "https://research.google/blog/",
 ]
 
-# ===== 追加：RSS/Atom（Zenn/Qiita/OpenAI など） =====
+# ===== RSS/Atom（Zenn/Qiita/OpenAI + 追加） =====
 ZENN_TOPICS = ["ai", "deeplearning", "nlp", "python", "機械学習"]
 QIITA_TAGS = ["ai", "machinelearning", "deeplearning", "nlp", "python", "llm", "生成ai"]
 
 FEED_URLS: List[Dict] = []
+# OpenAI
 FEED_URLS.append({"url": "https://openai.com/news/rss.xml", "source": "openai_news_rss"})
+
+# Zenn topic feed
 for tp in ZENN_TOPICS:
     FEED_URLS.append({"url": f"https://zenn.dev/topics/{tp}/feed", "source": f"zenn_topic:{tp}"})
+
+# Qiita tag feed
 for tg in QIITA_TAGS:
     FEED_URLS.append({"url": f"https://qiita.com/tags/{tg}/feed.atom", "source": f"qiita_tag:{tg}"})
 FEED_URLS.append({"url": "https://qiita.com/popular-items/feed.atom", "source": "qiita_popular"})
+
+# ★追加：取り逃しが出やすいサイトは RSS で担保
+FEED_URLS.append({"url": "https://www.publickey1.jp/atom.xml", "source": "publickey_atom"})
+FEED_URLS.append({"url": "https://www.analyticsvidhya.com/feed/", "source": "analyticsvidhya_feed"})
+FEED_URLS.append({"url": "https://towardsdatascience.com/feed", "source": "towardsdatascience_feed"})
 
 # ===== OpenAI（要約） =====
 client = None
@@ -189,9 +199,7 @@ DEFAULT_HEADERS = {
 def req(url: str, accept_xml: bool = False) -> Optional[requests.Response]:
     """
     403対策でUAを変えて一度だけ再試行。
-    非ASCII URLも安全に処理（latin-1 ヘッダ事故回避）:
-      - Referer を送らない
-      - URL をASCII化(パーセントエンコード)してから requests
+    非ASCII URLも安全に処理（Referer無送信 + URL ASCII化）。
     """
     try:
         safe_url = ascii_url(url)
@@ -256,7 +264,7 @@ def parse_datetime_text(s: str, base: dt.datetime) -> Optional[dt.datetime]:
     if not s:
         return None
 
-    # RSS/Atomの日時などは dateutil で先に試す
+    # RSS/Atom系は dateutil が強い
     try:
         d = dtparse(s)
         if d.tzinfo is None:
@@ -334,20 +342,23 @@ SITE_RULES = {
     "itmedia.co.jp": {"include": [r"/aiplus/articles/"], "exclude": [r"/author/", r"/rsslist", r"/category/", r"/tag/"]},
     "techno-edge.net": {"include": [r"/\d{4}/\d{2}/\d{2}/", r"/article/"], "exclude": [r"/tag/", r"/category/", r"/author/"]},
     "b.hatena.ne.jp": {"hatena_special": True},
+
     "zenn.dev": {"include": [r"^/[^/]+/articles/[^/]+/?$", r"^/articles/[^/]+/?$"], "exclude": [r"^/users?/", r"^/topics/", r"^/books/", r"^/scraps/", r"^/tags?/"]},
     "openai.com": {"include": [r"^/news/"], "exclude": [r"/team/", r"/researchers/", r"/about/"]},
     "news.microsoft.com": {"include": [r"^/source/"], "exclude": [r"/people/", r"/about/"]},
     "microsoft.com": {"include": [r"^/en-us/ai/blog/"], "exclude": []},
     "huggingface.co": {"include": [r"/blog/"], "exclude": [r"/authors?/"]},
+
     "ai-scholar.tech": {"include": [r"/ai_news/", r"/ai_trends/", r"/ai_book/", r"/ai_scholar/", r"/article/"], "exclude": [r"/category/", r"/tag/", r"/author/"]},
     "competition-content.signate.jp": {"include": [r"^/articles/[^/]+/?$"], "exclude": [r"/users?/", r"/tags?/"]},
     "kaggle.com": {"include": [r"^/blog/[^/?#]+/?$"], "exclude": []},
     "kdnuggets.com": {"include": [r"^/\d{4}/\d{2}/[^/][^?#]*(?:\.html)?/?(?:\?.*)?$"], "exclude": [r"^/tag/", r"^/tags?/"]},
-    "towardsdatascience.com": {"include": [], "exclude": []},
+    "towardsdatascience.com": {"include": [], "exclude": []},  # 記事はmedium側なので実質 medium rules を使う
     "medium.com": {"include": [r"^/towards-data-science/[^/]+-[0-9a-fA-F]{12}$", r"^/p/[0-9a-fA-F]{12}$"], "exclude": [r"^/tag/", r"/about/"]},
     "analyticsvidhya.com": {"include": [r"^/blog/\d{4}/\d{2}/[^/].*"], "exclude": [r"/category/", r"/tag/"]},
     "codezine.jp": {"include": [r"^/article/detail/\d+\.html$"], "exclude": [r"^/category/", r"^/tag/"]},
     "publickey1.jp": {"include": [r"^/blog/\d{4}/\d{2}/[^/].*\.html$"], "exclude": []},
+
     "anthropic.com": {"include": [r"^/news/"], "exclude": [r"/careers", r"/policy", r"/research"]},
     "blog.google": {"include": [r"^/technology/"], "exclude": [r"/about/"]},
     "deepmind.google": {"include": [r"^/blog/"], "exclude": []},
@@ -358,12 +369,12 @@ ZENN_ARTICLE_RE = re.compile(r"^/[^/]+/articles/[^/]+/?$")
 ZENN_USERLESS_RE = re.compile(r"^/articles/[^/]+/?$")
 KDN_ARTICLE_RE  = re.compile(r"^/\d{4}/\d{2}/[^/][^?#]*(?:\.html)?/?(?:\?.*)?$")
 
-# クロスホスト許可
+# クロスホスト許可（TDSは一覧が tds、記事が medium）
 CROSS_HOST_ALLOW: Dict[str, Set[str]] = {
     "towardsdatascience.com": {"towardsdatascience.com", "medium.com"},
 }
 
-# 一覧に時刻が無くても候補に残す
+# 一覧に時刻が無くても候補に残す（記事側で24h判定）
 ALLOW_NO_LIST_TIME = {
     "kdnuggets.com",
     "towardsdatascience.com",
@@ -381,14 +392,22 @@ ALLOW_NO_LIST_TIME = {
     "blog.google",
     "deepmind.google",
     "research.google",
-    "businessinsider.jp",  # ★追加：BIは一覧で時刻が取りにくいので記事側で判定
+    "publickey1.jp",
+    "businessinsider.jp",
 }
 
 def score_link_by_rules(href: str, base_host_raw: str) -> int:
+    """
+    ★修正ポイント：
+      towardsdatascience.com の一覧から medium.com の記事を拾うときは
+      medium.com の rules を適用する必要がある。
+    """
     p = urlparse(href)
     if not p.scheme.startswith("http"):
         return -999
+
     path = p.path or "/"
+    link_host = norm_host(p.netloc)
     base_host = norm_host(base_host_raw)
     score = 0
 
@@ -396,8 +415,9 @@ def score_link_by_rules(href: str, base_host_raw: str) -> int:
         if re.search(pat, path):
             score -= 100
 
-    rules_host = base_host
-    rules = SITE_RULES.get(rules_host, {})
+    # ★ここが重要：TDSだけは link_host で rules を引く
+    rules_host = link_host if base_host == "towardsdatascience.com" else base_host
+    rules = SITE_RULES.get(rules_host, SITE_RULES.get(base_host, {}))
 
     for pat in rules.get("include", []):
         if re.search(pat, path):
@@ -416,7 +436,6 @@ def pick_article_anchor(card, base_url: str) -> Optional[str]:
     base_host_raw = urlparse(base_url).netloc
     base_host = norm_host(base_host_raw)
 
-    # Hatena: 外部記事は a.entry-link 優先
     if SITE_RULES.get(base_host, {}).get("hatena_special"):
         a = card.select_one("a.entry-link[href]")
         if a:
@@ -426,7 +445,6 @@ def pick_article_anchor(card, base_url: str) -> Optional[str]:
     if not anchors:
         return None
 
-    # Zenn: 厳格＋短縮
     if base_host == "zenn.dev":
         for a in anchors:
             href = normalize_url(urljoin(base_url, a["href"]))
@@ -435,7 +453,6 @@ def pick_article_anchor(card, base_url: str) -> Optional[str]:
                 return href
         return None
 
-    # KDnuggets: 年/月/slug
     if base_host == "kdnuggets.com":
         for a in anchors:
             href = normalize_url(urljoin(base_url, a["href"]))
@@ -444,7 +461,6 @@ def pick_article_anchor(card, base_url: str) -> Optional[str]:
                 return href
         return None
 
-    # 日経は /atcl/ を最優先
     if base_host in {"business.nikkei.com", "xtech.nikkei.com"}:
         for a in anchors:
             href = normalize_url(urljoin(base_url, a["href"]))
@@ -452,7 +468,6 @@ def pick_article_anchor(card, base_url: str) -> Optional[str]:
             if re.search(r"/atcl/", path) and not any(re.search(pat, path) for pat in COMMON_EXCLUDES):
                 return href
 
-    # BIは /post- を優先
     if base_host == "businessinsider.jp":
         for a in anchors:
             href = normalize_url(urljoin(base_url, a["href"]))
@@ -465,6 +480,7 @@ def pick_article_anchor(card, base_url: str) -> Optional[str]:
         href = normalize_url(urljoin(base_url, a["href"]))
         if href.startswith(("mailto:", "tel:", "#")):
             continue
+
         score = score_link_by_rules(href, base_host_raw)
 
         a_text = (a.get_text(" ", strip=True) or "").lower()
@@ -534,7 +550,7 @@ def extract_list_candidates(url: str, allowed_hosts: Optional[Set[str]] = None) 
             if el:
                 meta.append(tx(el))
 
-        # ★追加：リンクテキスト（BIで時刻がここに入ることがある）
+        # BIで時刻がリンクテキストに入ることがある
         try:
             a = card.find("a", href=True)
             if a:
@@ -542,10 +558,7 @@ def extract_list_candidates(url: str, allowed_hosts: Optional[Set[str]] = None) 
         except Exception:
             pass
 
-        # ★追加：カード全体テキスト（保険）
         meta.append(tx(card))
-
-        # 既存：先頭の要素も
         meta += [tx(x) for x in card.find_all(["span","small","p"], limit=3)]
 
         ok, dttm, src = any_within(meta)
@@ -596,7 +609,6 @@ def _parse_root_to_items(root: ET.Element) -> List[Dict]:
         return tag.split("}", 1)[-1] if "}" in tag else tag
 
     items: List[Dict] = []
-
     if strip_ns(root.tag).lower() in ("rss", "rdf", "rdf:rdf"):
         channel = None
         for ch in list(root):
@@ -640,6 +652,7 @@ def _parse_root_to_items(root: ET.Element) -> List[Dict]:
                 items.append({"title": title, "link": normalize_url(link), "published_raw": pub or upd})
         return items
 
+    # fallback
     for ent in root.findall(".//*"):
         if strip_ns(ent.tag).lower() == "entry":
             title = ""
@@ -672,6 +685,7 @@ def parse_feed_items(feed_url: str) -> List[Dict]:
         root = ET.fromstring(raw)
         return _parse_root_to_items(root)
     except Exception as e1:
+        # 壊れXML/HTML返却でも拾えることがある
         try:
             soup = BeautifulSoup(raw, "xml")
             items: List[Dict] = []
@@ -734,6 +748,7 @@ def extract_article(url: str) -> Dict:
     if r:
         soup = soup_from_response(r)
 
+    # trafilatura（HTML文字列）
     if soup is not None:
         try:
             html = str(soup)
@@ -743,6 +758,7 @@ def extract_article(url: str) -> Dict:
         except Exception:
             pass
 
+    # requests失敗時はURLダウンローダ
     if not r:
         try:
             downloaded = fetch_url(ascii_url(url))
@@ -753,6 +769,7 @@ def extract_article(url: str) -> Dict:
         except Exception:
             pass
 
+    # readability フォールバック
     if (soup is not None) and (len(out["text"]) < 200):
         try:
             doc = Document(str(soup))
@@ -767,6 +784,7 @@ def extract_article(url: str) -> Dict:
         except Exception:
             pass
 
+    # <article>/p 連結
     if (soup is not None) and (len(out["text"]) < 200):
         paras = []
         art = soup.find("article")
@@ -780,6 +798,7 @@ def extract_article(url: str) -> Dict:
             if len(joined) > len(out["text"]):
                 out["text"] = joined
 
+    # タイトル / canonical / og:url
     canonical_url = None
     if soup is not None:
         title_tag = soup.find("meta", property="og:title") or soup.find("title")
@@ -793,6 +812,7 @@ def extract_article(url: str) -> Dict:
             canonical_url = ogu["content"]
     out["canonical_url"] = normalize_url(canonical_url) if canonical_url else ""
 
+    # 公開日時抽出（meta, time, JSON-LD）
     cand_dt, best_src = None, ""
     if soup is not None:
         time_texts = []
@@ -840,31 +860,6 @@ def extract_article(url: str) -> Dict:
             dtm = parse_datetime_text(s, NOW)
             if dtm and ((cand_dt is None) or (dtm > cand_dt)):
                 cand_dt, best_src = dtm, s
-
-    if (cand_dt is None) and (soup is not None) and (norm_host(urlparse(url).netloc) == "zenn.dev"):
-        try:
-            next_data = soup.find("script", id="__NEXT_DATA__")
-            if next_data and next_data.string:
-                data = json.loads(next_data.string)
-                def dfs(o, found):
-                    if isinstance(o, dict):
-                        for k, v in o.items():
-                            if k in {"publishedAt","published_at","released_at","datePublished"} and isinstance(v, str):
-                                found.append(v)
-                            dfs(v, found)
-                    elif isinstance(o, list):
-                        for x in o:
-                            dfs(x, found)
-                bag = []
-                dfs(data, bag)
-                for s in bag:
-                    dd = parse_datetime_text(s, NOW)
-                    if dd:
-                        cand_dt = dd
-                        best_src = s
-                        break
-        except Exception:
-            pass
 
     out["published_dt"] = cand_dt
     out["published_raw"] = best_src
@@ -953,7 +948,7 @@ def main():
 
     candidates: List[Dict] = []
 
-    # 1) HTML一覧から候補収集（元々の取得先を維持）
+    # 1) HTML一覧から候補収集
     for lp in TARGET_LIST_PAGES:
         print(f"🔎 List: {lp}")
         rows = collect_from_list(lp)
@@ -961,13 +956,13 @@ def main():
         candidates.extend(rows)
         time.sleep(SLEEP_LIST)
 
-    # 2) RSS/Atomから候補収集（Zenn/Qiita/OpenAI）
+    # 2) RSS/Atomから候補収集
     for fd in FEED_URLS:
         rows = collect_from_feed(fd)
         candidates.extend(rows)
         time.sleep(SLEEP_FEED)
 
-    # 3) 候補：URL正規化してから title で重複削除（list_time_guess が新しい方）
+    # 3) 候補：titleで重複削除（list_time_guessが新しい方を残す）
     for r in candidates:
         r["link"] = normalize_url(r.get("link",""))
         r["title"] = (r.get("title") or "").strip()
@@ -975,7 +970,7 @@ def main():
     candidates = dedupe_by_title_keep_latest(candidates, time_key="list_time_guess")
     print(f"\n🧮 Unique candidates (dedup by title): {len(candidates)}")
 
-    # 4) 本文抽出 & lookback再判定 & 要約
+    # 4) 本文抽出 & lookback判定 & 要約
     results: List[Dict] = []
     for i, it in enumerate(candidates, 1):
         url = it["link"]
