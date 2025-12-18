@@ -5,23 +5,22 @@
 
 ✅ この版で解決していること
 - 元々の取得先（HTML一覧）は残したまま（消えない）
+- Business Insider の記事が一覧で時刻を拾えず 0 件になる問題を修正
+  - ALLOW_NO_LIST_TIME に businessinsider.jp を追加（一覧時刻が無くても候補に残す）
+  - カード全体/リンクテキストも meta 候補に追加して時刻を拾いやすく
 - Zenn / Qiita は RSS/Atom から取得（JS依存・DOM変更に強い）
-  - Zenn: https://zenn.dev/topics/<topic>/feed
-  - Qiita: https://qiita.com/tags/<tag>/feed.atom / popular-items
-- Zennの日本語URLで落ちる（latin-1 codec）を修正
-  - Refererヘッダを送らない
-  - URLをASCII(パーセントエンコード)化してから requests
-- OpenAI / Microsoft / Google / Anthropic など「公式/準公式」も追加
-  - OpenAIは公式RSS https://openai.com/news/rss.xml（/ja-JP/news の 403 を回避）
-- RSS/Atom の XML パースが壊れるケース（BOM/制御文字/HTML返却）に耐性
-  - r.content を使って BOM/先頭制御文字を除去してからパース
-  - ElementTreeが失敗したら BeautifulSoup("xml") にフォールバック
+- Zennの日本語URLで落ちる（latin-1 codec）を修正（Refererを送らない＋URL ASCII化）
+- OpenAI RSS の XML パース失敗（BOM/制御文字/HTML返却）耐性（ET→BS(xml)フォールバック）
+- OpenAI / Microsoft / Google / Anthropic など公式/準公式も追加
 - 同じtitleは重複削除（候補段階 + 結果段階）
 """
 
 import os, re, time, datetime as dt, sys, logging, json
 from typing import List, Dict, Optional, Tuple, Set
-from urllib.parse import urljoin, urlparse, parse_qsl, urlencode, urlsplit, urlunsplit, quote
+from urllib.parse import (
+    urljoin, urlparse, parse_qsl, urlencode,
+    urlsplit, urlunsplit, quote
+)
 
 import requests
 from bs4 import BeautifulSoup
@@ -143,12 +142,8 @@ TARGET_LIST_PAGES = [
     "https://www.publickey1.jp/",
 
     # --- 追加（公式/準公式 AI ニュース） ---
-    # OpenAI HTMLは403が出やすいのでRSSで取得（下のFEEDで対応）
-    # Microsoft (公式AIブログ)
     "https://www.microsoft.com/en-us/ai/blog/",
-    # Anthropic (newsroom)
     "https://www.anthropic.com/news",
-    # Google / DeepMind / Research
     "https://blog.google/technology/ai/",
     "https://blog.google/technology/google-deepmind/",
     "https://deepmind.google/blog/",
@@ -160,18 +155,11 @@ ZENN_TOPICS = ["ai", "deeplearning", "nlp", "python", "機械学習"]
 QIITA_TAGS = ["ai", "machinelearning", "deeplearning", "nlp", "python", "llm", "生成ai"]
 
 FEED_URLS: List[Dict] = []
-
-# OpenAI（公式RSS）
 FEED_URLS.append({"url": "https://openai.com/news/rss.xml", "source": "openai_news_rss"})
-
-# Zenn（topics feed）
 for tp in ZENN_TOPICS:
     FEED_URLS.append({"url": f"https://zenn.dev/topics/{tp}/feed", "source": f"zenn_topic:{tp}"})
-
-# Qiita（tag feed.atom）
 for tg in QIITA_TAGS:
     FEED_URLS.append({"url": f"https://qiita.com/tags/{tg}/feed.atom", "source": f"qiita_tag:{tg}"})
-# Qiita popular
 FEED_URLS.append({"url": "https://qiita.com/popular-items/feed.atom", "source": "qiita_popular"})
 
 # ===== OpenAI（要約） =====
@@ -224,7 +212,6 @@ def req(url: str, accept_xml: bool = False) -> Optional[requests.Response]:
             print(f"[warn] HTTP {r.status_code}: {url}")
             return None
 
-        # encodingは必要なときだけ下流で決める（RSSは content から処理）
         return r
     except Exception as e:
         print(f"[error] request failed: {url} -> {e}")
@@ -394,6 +381,7 @@ ALLOW_NO_LIST_TIME = {
     "blog.google",
     "deepmind.google",
     "research.google",
+    "businessinsider.jp",  # ★追加：BIは一覧で時刻が取りにくいので記事側で判定
 }
 
 def score_link_by_rules(href: str, base_host_raw: str) -> int:
@@ -401,7 +389,6 @@ def score_link_by_rules(href: str, base_host_raw: str) -> int:
     if not p.scheme.startswith("http"):
         return -999
     path = p.path or "/"
-    link_host = norm_host(p.netloc)
     base_host = norm_host(base_host_raw)
     score = 0
 
@@ -409,8 +396,8 @@ def score_link_by_rules(href: str, base_host_raw: str) -> int:
         if re.search(pat, path):
             score -= 100
 
-    rules_host = link_host if base_host == "towardsdatascience.com" else base_host
-    rules = SITE_RULES.get(rules_host, SITE_RULES.get(base_host, {}))
+    rules_host = base_host
+    rules = SITE_RULES.get(rules_host, {})
 
     for pat in rules.get("include", []):
         if re.search(pat, path):
@@ -457,14 +444,19 @@ def pick_article_anchor(card, base_url: str) -> Optional[str]:
                 return href
         return None
 
-    # 日経は /atcl/ を最優先で拾う
+    # 日経は /atcl/ を最優先
     if base_host in {"business.nikkei.com", "xtech.nikkei.com"}:
         for a in anchors:
             href = normalize_url(urljoin(base_url, a["href"]))
             path = urlparse(href).path or "/"
-            if re.search(r"/atcl/", path):
-                if any(re.search(pat, path) for pat in COMMON_EXCLUDES):
-                    continue
+            if re.search(r"/atcl/", path) and not any(re.search(pat, path) for pat in COMMON_EXCLUDES):
+                return href
+
+    # BIは /post- を優先
+    if base_host == "businessinsider.jp":
+        for a in anchors:
+            href = normalize_url(urljoin(base_url, a["href"]))
+            if re.search(r"/post-\d+", urlparse(href).path or ""):
                 return href
 
     # 一般スコアリング
@@ -508,7 +500,6 @@ def extract_list_candidates(url: str, allowed_hosts: Optional[Set[str]] = None) 
 
     allowed_norm = {norm_host(h) for h in allowed_hosts} if allowed_hosts is not None else None
 
-    # カード候補要素を広めに取る
     candidates = soup.select("article, li, div, section, dd")
     if not candidates:
         candidates = soup.find_all(True)
@@ -517,6 +508,7 @@ def extract_list_candidates(url: str, allowed_hosts: Optional[Set[str]] = None) 
         link = pick_article_anchor(card, url)
         if not link:
             return
+
         link_host_norm = norm_host(urlparse(link).netloc)
         if allowed_norm is not None and link_host_norm not in allowed_norm:
             if not SITE_RULES.get(base_host, {}).get("hatena_special"):
@@ -539,14 +531,28 @@ def extract_list_candidates(url: str, allowed_hosts: Optional[Set[str]] = None) 
         meta += [tx(x) for x in card.select("time")]
         for cls in ["time","date","timestamp","modDate","update","c-article__time","c-card__time","pubdate"]:
             el = card.find(class_=cls)
-            if el: meta.append(tx(el))
-        meta += [tx(x) for x in card.find_all(["span","small","p"], limit=3)]
-        ok, dttm, src = any_within(meta)
+            if el:
+                meta.append(tx(el))
 
+        # ★追加：リンクテキスト（BIで時刻がここに入ることがある）
+        try:
+            a = card.find("a", href=True)
+            if a:
+                meta.append(tx(a))
+        except Exception:
+            pass
+
+        # ★追加：カード全体テキスト（保険）
+        meta.append(tx(card))
+
+        # 既存：先頭の要素も
+        meta += [tx(x) for x in card.find_all(["span","small","p"], limit=3)]
+
+        ok, dttm, src = any_within(meta)
         if not ok and base_host not in ALLOW_NO_LIST_TIME:
             return
 
-        key = (title.strip(), link)
+        key = (title.strip(), normalize_url(link))
         if key in seen:
             return
         seen.add(key)
@@ -561,7 +567,6 @@ def extract_list_candidates(url: str, allowed_hosts: Optional[Set[str]] = None) 
     for card in candidates:
         push_card(card)
 
-    # 0件なら a[href] 全走査の最終保険
     if not items:
         for a in soup.find_all("a", href=True):
             faux = soup.new_tag("div")
@@ -592,7 +597,6 @@ def _parse_root_to_items(root: ET.Element) -> List[Dict]:
 
     items: List[Dict] = []
 
-    # RSS2
     if strip_ns(root.tag).lower() in ("rss", "rdf", "rdf:rdf"):
         channel = None
         for ch in list(root):
@@ -601,7 +605,6 @@ def _parse_root_to_items(root: ET.Element) -> List[Dict]:
                 break
         if channel is None:
             channel = root
-
         for it in channel.findall(".//item"):
             title = (it.findtext("title") or "").strip()
             link = (it.findtext("link") or "").strip()
@@ -614,7 +617,6 @@ def _parse_root_to_items(root: ET.Element) -> List[Dict]:
                 items.append({"title": title, "link": normalize_url(link), "published_raw": pub})
         return items
 
-    # Atom
     if strip_ns(root.tag).lower() == "feed":
         ns = "{http://www.w3.org/2005/Atom}"
         for ent in root.findall(f".//{ns}entry"):
@@ -638,7 +640,6 @@ def _parse_root_to_items(root: ET.Element) -> List[Dict]:
                 items.append({"title": title, "link": normalize_url(link), "published_raw": pub or upd})
         return items
 
-    # その他（最低限）
     for ent in root.findall(".//*"):
         if strip_ns(ent.tag).lower() == "entry":
             title = ""
@@ -665,15 +666,12 @@ def parse_feed_items(feed_url: str) -> List[Dict]:
     if not raw:
         return []
 
-    # UTF-8 BOM除去 + 先頭空白/制御文字除去
     raw = raw.lstrip(b"\xef\xbb\xbf").lstrip()
 
-    # ETで挑戦
     try:
         root = ET.fromstring(raw)
         return _parse_root_to_items(root)
     except Exception as e1:
-        # フォールバック：BeautifulSoup(xml) で救済
         try:
             soup = BeautifulSoup(raw, "xml")
             items: List[Dict] = []
@@ -713,7 +711,6 @@ def collect_from_feed(feed: Dict) -> List[Dict]:
 
         pub_dt = parse_datetime_text(it.get("published_raw",""), NOW)
 
-        # feedは日付があればlist_time_guessに載せる。無い場合は空（後段で記事側で判定）
         out.append({
             "source_list": url,
             "title": title,
@@ -737,7 +734,6 @@ def extract_article(url: str) -> Dict:
     if r:
         soup = soup_from_response(r)
 
-    # trafilatura（HTML文字列）
     if soup is not None:
         try:
             html = str(soup)
@@ -747,7 +743,6 @@ def extract_article(url: str) -> Dict:
         except Exception:
             pass
 
-    # requests失敗時はURLダウンローダ
     if not r:
         try:
             downloaded = fetch_url(ascii_url(url))
@@ -758,7 +753,6 @@ def extract_article(url: str) -> Dict:
         except Exception:
             pass
 
-    # readability フォールバック
     if (soup is not None) and (len(out["text"]) < 200):
         try:
             doc = Document(str(soup))
@@ -773,7 +767,6 @@ def extract_article(url: str) -> Dict:
         except Exception:
             pass
 
-    # <article>/p 連結
     if (soup is not None) and (len(out["text"]) < 200):
         paras = []
         art = soup.find("article")
@@ -787,7 +780,6 @@ def extract_article(url: str) -> Dict:
             if len(joined) > len(out["text"]):
                 out["text"] = joined
 
-    # タイトル / canonical / og:url
     canonical_url = None
     if soup is not None:
         title_tag = soup.find("meta", property="og:title") or soup.find("title")
@@ -801,7 +793,6 @@ def extract_article(url: str) -> Dict:
             canonical_url = ogu["content"]
     out["canonical_url"] = normalize_url(canonical_url) if canonical_url else ""
 
-    # 公開日時抽出（meta, time, JSON-LD）
     cand_dt, best_src = None, ""
     if soup is not None:
         time_texts = []
@@ -832,6 +823,7 @@ def extract_article(url: str) -> Dict:
                 ttxt = tx(el)
                 if ttxt:
                     time_texts.append(ttxt)
+
         for sc in soup.find_all("script", type=lambda t: t and "ld+json" in t):
             try:
                 data = json.loads(sc.string or "")
@@ -849,7 +841,6 @@ def extract_article(url: str) -> Dict:
             if dtm and ((cand_dt is None) or (dtm > cand_dt)):
                 cand_dt, best_src = dtm, s
 
-    # Zenn の __NEXT_DATA__ からも取得（未確定時）
     if (cand_dt is None) and (soup is not None) and (norm_host(urlparse(url).netloc) == "zenn.dev"):
         try:
             next_data = soup.find("script", id="__NEXT_DATA__")
@@ -933,7 +924,6 @@ def summarize_article(title: str, url: str, body: str) -> str:
 
 # ===== 重複削除（title単位：新しい方を残す） =====
 def pick_newer_by_time(a: Dict, b: Dict, time_key: str) -> Dict:
-    """aとbを比較して time_key が新しい方を返す（片方が無い場合はある方優先）"""
     ta = a.get(time_key) or ""
     tb = b.get(time_key) or ""
     if ta and tb:
@@ -942,7 +932,7 @@ def pick_newer_by_time(a: Dict, b: Dict, time_key: str) -> Dict:
         return a
     if tb and not ta:
         return b
-    return a  # 両方なしなら先勝ち
+    return a
 
 def dedupe_by_title_keep_latest(rows: List[Dict], time_key: str) -> List[Dict]:
     best: Dict[str, Dict] = {}
@@ -996,7 +986,6 @@ def main():
         print(f"\n🌐 [{i}/{len(candidates)}] {title[:60]} ...")
         art = extract_article(url)
 
-        # 公開日時: 記事側が取れればそれ、無ければ一覧(=feed含む)推定
         pub_dt = art["published_dt"]
         if not pub_dt and it.get("list_time_guess"):
             try:
@@ -1009,7 +998,6 @@ def main():
             time.sleep(SLEEP_ARTICLE)
             continue
 
-        # canonical が同一/許容ホストなら差し替え
         final_url = url
         if art.get("canonical_url"):
             cu = urlparse(art["canonical_url"])
