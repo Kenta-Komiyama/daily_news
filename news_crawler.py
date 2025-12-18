@@ -172,6 +172,8 @@ FEED_URLS.append({"url": "https://www.publickey1.jp/atom.xml", "source": "public
 FEED_URLS.append({"url": "https://www.analyticsvidhya.com/feed/", "source": "analyticsvidhya_feed"})
 FEED_URLS.append({"url": "https://towardsdatascience.com/feed", "source": "towardsdatascience_feed"})
 FEED_URLS.append({"url": "https://rss.itmedia.co.jp/rss/2.0/aiplus.xml", "source": "itmedia_aiplus_rss"})
+FEED_URLS.append({"url": "https://www.kdnuggets.com/feed", "source": "kdnuggets_feed"})
+FEED_URLS.append({"url": "https://feeds.feedburner.com/kdnuggets-data-mining-analytics", "source": "kdnuggets_feedburner"})
 
 # ===== OpenAI（要約） =====
 client = None
