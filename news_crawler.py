@@ -125,7 +125,7 @@ TARGET_LIST_PAGES = [
     "https://research.google/blog/",
 
     # データ/DS系
-    "https://ai-scholar.tech/",
+    "https://ai-scholar.tech/articles",
     "https://competition-content.signate.jp/articles",
     "https://www.kaggle.com/blog?sort=hotness",
     "https://www.kdnuggets.com/news/index.html",
@@ -171,6 +171,7 @@ FEED_URLS.append({"url": "https://qiita.com/popular-items/feed.atom", "source": 
 FEED_URLS.append({"url": "https://www.publickey1.jp/atom.xml", "source": "publickey_atom"})
 FEED_URLS.append({"url": "https://www.analyticsvidhya.com/feed/", "source": "analyticsvidhya_feed"})
 FEED_URLS.append({"url": "https://towardsdatascience.com/feed", "source": "towardsdatascience_feed"})
+FEED_URLS.append({"url": "https://rss.itmedia.co.jp/rss/2.0/aiplus.xml", "source": "itmedia_aiplus_rss"})
 
 # ===== OpenAI（要約） =====
 client = None
