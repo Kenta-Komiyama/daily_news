@@ -104,7 +104,7 @@ TARGET_LIST_PAGES = [
     "https://www.businessinsider.jp/category/science/",
     "https://www.businessinsider.jp/tag/start-up/",
     "https://xtech.nikkei.com/top/it/",
-    "https://www.itmedia.co.jp/aiplus/spv/",
+    "https://www.itmedia.co.jp/aiplus/subtop/news/index.html",
     "https://www.techno-edge.net/special/557/recent/%E7%94%9F%E6%88%90AI%E3%82%A6%E3%82%A3%E3%83%BC%E3%82%AF%E3%83%AA%E3%83%BC",
     "https://b.hatena.ne.jp/hotentry/it",
     "https://b.hatena.ne.jp/entrylist/it/AI%E3%83%BB%E6%A9%9F%E6%A2%B0%E5%AD%A6%E7%BF%92",
