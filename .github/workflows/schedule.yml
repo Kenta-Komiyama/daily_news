@@ -2,7 +2,7 @@ name: Daily News Crawl
 
 on:
   schedule:
-    - cron: "0 17 * * *"   # 17:00 UTC = 02:00 JST
+    - cron: "0 16 * * *"   # 16:00 UTC = 01:00 JST
   workflow_dispatch: {}
 
 permissions:
